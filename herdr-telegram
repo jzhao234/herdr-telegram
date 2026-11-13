@@ -1,0 +1,21 @@
+#!/usr/bin/env python3
+"""CLI entrypoint for herdr-telegram."""
+
+from __future__ import annotations
+
+import os
+import sys
+from pathlib import Path
+
+if sys.version_info < (3, 11) and os.environ.get("_HERDR_TG_REEXEC") != "1":
+    for _cand in ("/opt/homebrew/bin/python3", "/usr/local/bin/python3"):
+        if os.path.isfile(_cand) and os.access(_cand, os.X_OK):
+            os.environ["_HERDR_TG_REEXEC"] = "1"
+            os.execv(_cand, [_cand, __file__, *sys.argv[1:]])
+    sys.exit("Error: herdr-telegram requires Python 3.11 or newer.")
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from herdr_telegram import main  # noqa: E402
+
+if __name__ == "__main__":
+    raise SystemExit(main())

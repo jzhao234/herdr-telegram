@@ -1,12 +1,14 @@
 # herdr-telegram
 
+[![CI](https://github.com/jzhao234/herdr-telegram/actions/workflows/ci.yml/badge.svg)](https://github.com/jzhao234/herdr-telegram/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-3776AB.svg)](pyproject.toml)
+[![Platform: Linux | macOS](https://img.shields.io/badge/platform-Linux%20%7C%20macOS-lightgrey.svg)](install.sh)
 [![Zero Dependencies](https://img.shields.io/badge/dependencies-zero-brightgreen.svg)](pyproject.toml)
 
 Modular two-way Telegram bridge and Tailscale mobile preview toolkit for [Herdr](https://github.com/herdrdev/herdr) terminal coding agents (`claude`, `codex`, `gemini`, `agy`, `opencode`, `cursor`, `pi`, `amp`, `droid`, and custom agent profiles).
 
-Runs as a lightweight `systemd --user` daemon on pure Python 3.11+ standard library (`tomllib` included, zero pip dependencies). When an agent finishes unattended or pauses on an approval dialog, `herdr-telegram` sends a clean mobile digest or tap-ready option buttons to your phone, and routes your swipe-replies right back into that terminal pane.
+Runs as a lightweight user daemon (`systemd --user` on Linux, `launchd` on macOS) using pure Python 3.11+ standard library (`tomllib` included, zero pip dependencies). When an agent finishes unattended or pauses on an approval dialog, `herdr-telegram` sends a clean mobile digest or tap-ready option buttons to your phone, and routes your swipe-replies or screenshots right back into that terminal pane.
 
 ---
 
@@ -72,9 +74,9 @@ Swipe-reply to any card (or prefix `opus: ship it`) and `herdr-telegram` deliver
 
 ---
 
-## One-Line Install
+## One-Line Install (Linux & macOS)
 
-Requires Linux with `systemd --user`, `python3` (>= 3.11), `git`, and [Herdr](https://github.com/herdrdev/herdr).
+Requires Linux (`systemd --user`) or macOS (`launchd`), `python3` (>= 3.11), `git`, and [Herdr](https://github.com/herdrdev/herdr).
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/jzhao234/herdr-telegram/main/install.sh | bash
@@ -87,20 +89,29 @@ git clone https://github.com/jzhao234/herdr-telegram.git
 cd herdr-telegram && ./install.sh
 ```
 
-### 60-Second Setup
+### 30-Second Interactive Pairing (`herdr-telegram setup`)
 
 1. Message [`@BotFather`](https://t.me/BotFather) on Telegram with `/newbot` and copy your bot token.
-2. Put `TELEGRAM_BOT_TOKEN=<your-token>` into `~/.config/herdr-telegram/env` (`chmod 600` is set automatically).
-3. Start the user service:
+2. Run the interactive onboarding wizard:
    ```bash
-   systemctl --user enable --now herdr-telegram.service
+   herdr-telegram setup
    ```
-4. Send `/start` to your new bot on Telegram. It will reply with your numeric `TELEGRAM_CHAT_ID`; add `TELEGRAM_CHAT_ID=<id>` to `~/.config/herdr-telegram/env` and restart:
+   It prompts for your `@BotFather` token (hidden input), registers your bot's `/` command menu automatically, prints a one-time `https://t.me/<bot>?start=<code>` pairing link for your phone to capture your `TELEGRAM_CHAT_ID` securely, writes `~/.config/herdr-telegram/env` (`0600`), and starts the background service (`systemd --user` on Linux or `launchd` on macOS).
+3. Run a full health check anytime:
    ```bash
-   systemctl --user restart herdr-telegram.service
+   herdr-telegram doctor
    ```
 
-Re-run the one-line install command anytime to pull updates cleanly without overwriting `~/.config/herdr-telegram/env` or `~/.config/herdr-telegram/config.toml`.
+<details>
+<summary><b>Headless / manual setup, logs, CLI-only install (uv / pipx), and uninstall</b></summary>
+
+- **Manual headless setup:** Add `TELEGRAM_BOT_TOKEN=<token>` to `~/.config/herdr-telegram/env`, start the service (`systemctl --user enable --now herdr-telegram.service` on Linux or `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/io.github.jzhao234.herdr-telegram.plist` on macOS), send `/start` to your bot to discover `TELEGRAM_CHAT_ID`, add it to `env`, and restart.
+- **Inspecting service logs:** Run `journalctl --user -u herdr-telegram.service -f` on Linux or `tail -f ~/.local/state/herdr-telegram/bridge.log` on macOS.
+- **Re-running updates:** Re-run the one-line install command anytime to pull updates cleanly without overwriting `~/.config/herdr-telegram/env` or `~/.config/herdr-telegram/config.toml`.
+- **Uninstalling:** Run `~/.local/share/herdr-telegram/install.sh --uninstall` (or `curl -fsSL https://raw.githubusercontent.com/jzhao234/herdr-telegram/main/install.sh | bash -s -- --uninstall`) to stop the service and remove installed files while keeping `~/.config/herdr-telegram` (`--purge` removes bridge config and state files too).
+- **Installing via `uv tool` or `pipx`:** `uv tool install git+https://github.com/jzhao234/herdr-telegram.git` installs the `herdr-telegram`, `telegram-send`, and `ts-preview` CLIs without registering an OS service (`install.sh` is recommended when you want automatic `systemd` / `launchd` service setup). Always install from this GitHub repository URL rather than bare `pip install telegram-send`, which is an unrelated legacy PyPI package.
+
+</details>
 
 ---
 
@@ -174,6 +185,8 @@ You can also use `provider:model` shorthand directly in `HERDR_SUMMARY_MODEL` (s
 
 ## Telegram Commands & Reply Routing
 
+On startup, `herdr-telegram` automatically registers these commands in Telegram's native `/` menu picker across every configured bot:
+
 | Action | Syntax | What it does |
 | :--- | :--- | :--- |
 | **Swipe-reply** | Swipe any alert or `telegram-send` card | Sends your reply (or photo/screenshot) straight to the bound pane (skips the idle completion wait) |
@@ -191,6 +204,16 @@ You can also use `provider:model` shorthand directly in `HERDR_SUMMARY_MODEL` (s
 
 ## CLI Helpers
 
+### `herdr-telegram`: Setup, Diagnostics, and Daemon
+
+```bash
+# Interactive 30-second pairing wizard (@BotFather token + /start auto-discovery + service start)
+herdr-telegram setup
+
+# Full diagnostic check (--json and --offline supported)
+herdr-telegram doctor
+```
+
 ### `telegram-send`: Proactive Agent Notifications & Photos
 
 Agents (or CI/deploy scripts) can message you or send screenshots without ever reading your bot token:
@@ -206,7 +229,7 @@ telegram-send --photo ./artifacts/login-mobile.png "Updated mobile layout; appro
 telegram-send --bot ops "🟢 HTTP health (12/12 endpoints healthy)"
 ```
 
-If you installed with a custom `HERDR_TELEGRAM_CONFIG_DIR`, export `HERDR_TELEGRAM_CONFIG_DIR` in your shell profile as well so `telegram-send` reads the same directory as the systemd service.
+If you installed with a custom `HERDR_TELEGRAM_CONFIG_DIR`, export `HERDR_TELEGRAM_CONFIG_DIR` in your shell profile as well so `telegram-send` reads the same directory as the background service.
 
 ### `ts-preview`: Mobile Dev Server Previews over Tailscale
 
@@ -246,8 +269,8 @@ ts-preview reset
 Zero third-party runtime dependencies. Run formatting, lint, shellcheck, and the unit test suite locally:
 
 ```bash
-uvx ruff format --check . telegram-send ts-preview
-uvx ruff check . telegram-send ts-preview
+uvx ruff format --check . herdr-telegram telegram-send ts-preview
+uvx ruff check . herdr-telegram telegram-send ts-preview
 shellcheck install.sh
 python3 -m unittest discover -s . -v
 ```

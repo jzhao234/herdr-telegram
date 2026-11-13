@@ -7,6 +7,7 @@ import importlib.util
 import io
 import json
 import os
+import plistlib
 import shutil
 import stat
 import struct
@@ -35,11 +36,16 @@ from bridge import (
     parse_env_file,
     prune_media_dir,
     read_outbound_image,
+    run_doctor,
+    run_setup,
     save_inbound_image,
+    seed_environ_from_env_file,
     sniff_image_bytes,
+    upsert_env_values,
 )
 from herdr_telegram import (
     AGENT_NAME_RE,
+    BOT_MENU_COMMANDS,
     DEFAULT_SUMMARY_MODEL,
     DEFAULT_SUMMARY_PROVIDER,
     SUMMARY_DENY_SETTINGS_JSON,
@@ -3375,7 +3381,9 @@ class HerdrTelegramBridgeTest(unittest.TestCase):
             shutil.copytree(repo_root / "bridge", origin_repo / "bridge")
             for fname in (
                 "herdr_telegram.py",
+                "herdr-telegram",
                 "telegram-send",
+                "telegram_send.py",
                 "ts-preview",
                 "ts_preview.py",
                 "herdr-telegram.service",
@@ -4638,6 +4646,370 @@ class HerdrTelegramBridgeTest(unittest.TestCase):
                 )
                 combined_verify = (verify_proc.stdout + "\n" + verify_proc.stderr).lower()
                 self.assertNotIn("environmentfile= path is not absolute", combined_verify)
+
+    def test_bot_menu_commands_upsert_env_seed_environ_doctor_setup_and_darwin_uninstall(self) -> None:
+        # 1. TelegramClient.get_me() + set_my_commands() + BridgeDaemon._sync_bot_commands()
+        posted: list[tuple[str, dict[str, Any]]] = []
+
+        class CmdMenuHandler(BaseHTTPRequestHandler):
+            def do_POST(self) -> None:
+                length = int(self.headers.get("Content-Length", "0"))
+                payload = json.loads(self.rfile.read(length).decode("utf-8"))
+                posted.append((self.path, payload))
+                if self.path.endswith("/getMe"):
+                    resp_obj: dict[str, Any] = {"ok": True, "result": {"id": 42, "username": "herdr_test_bot"}}
+                else:
+                    resp_obj = {"ok": True, "result": True}
+                raw = json.dumps(resp_obj).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+
+            def log_message(self, fmt: str, *args: Any) -> None:
+                del fmt, args
+
+        srv = HTTPServer(("127.0.0.1", 0), CmdMenuHandler)
+        port = srv.server_address[1]
+        th = threading.Thread(target=srv.serve_forever, daemon=True)
+        th.start()
+        try:
+            tg1 = TelegramClient("111:aaa")
+            tg1.base_url = f"http://127.0.0.1:{port}/bot111:aaa"
+            tg2 = TelegramClient("222:bbb")
+            tg2.base_url = f"http://127.0.0.1:{port}/bot222:bbb"
+            me = tg1.get_me()
+            self.assertEqual(me["username"], "herdr_test_bot")
+
+            with tempfile.TemporaryDirectory() as tmp:
+                daemon = BridgeDaemon(
+                    herdr=FakeHerdr({}),  # type: ignore[arg-type]
+                    telegram=tg1,
+                    chat_id="777",
+                    state_path=Path(tmp) / "state.json",
+                    bot_channels={"default": (tg1, "777"), "ops": (tg2, "777")},
+                    async_summaries=False,
+                )
+                try:
+                    daemon._sync_bot_commands()
+                finally:
+                    daemon.close()
+
+            menu_calls = [item for item in posted if item[0].endswith("/setMyCommands")]
+            self.assertEqual(len(menu_calls), 2)
+            expected_cmds = [{"command": c, "description": d} for c, d in BOT_MENU_COMMANDS]
+            self.assertEqual(menu_calls[0][1]["commands"], expected_cmds)
+            self.assertEqual(menu_calls[1][1]["commands"], expected_cmds)
+        finally:
+            srv.shutdown()
+            srv.server_close()
+
+        # 2. upsert_env_values & seed_environ_from_env_file + HerdrClient child-env scrubbing
+        with patch.dict(
+            "os.environ",
+            {
+                "TELEGRAM_BOT_TOKEN": "111:secret_bot_tok",
+                "HERDR_SUMMARY_API_KEY": "sk-summary-secret",
+                "OPENAI_API_KEY": "sk-openai-secret",
+                "HERDR_BIN": "/usr/bin/herdr",
+            },
+        ):
+            child_env = HerdrClient._build_child_env()
+            self.assertNotIn("TELEGRAM_BOT_TOKEN", child_env)
+            self.assertNotIn("HERDR_SUMMARY_API_KEY", child_env)
+            self.assertNotIn("OPENAI_API_KEY", child_env)
+            self.assertEqual(child_env["HERDR_BIN"], "/usr/bin/herdr")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            env_file = tmp_path / "cfg" / "env"
+            env_file.parent.mkdir(parents=True, exist_ok=True)
+            # Include a duplicate TELEGRAM_CHAT_ID line to verify deduplication on update
+            env_file.write_text(
+                "# Keep comment\nexport TELEGRAM_BOT_TOKEN=old_tok\nTELEGRAM_CHAT_ID=\nCUSTOM_NOTE=plain\nTELEGRAM_CHAT_ID=stale_111\n",
+                encoding="utf-8",
+            )
+            os.chmod(env_file, 0o644)
+            upsert_env_values(
+                env_file,
+                {
+                    "TELEGRAM_BOT_TOKEN": "999:new_tok",
+                    "TELEGRAM_CHAT_ID": "12345678",
+                    "CUSTOM_NOTE": 'value with # and "quotes"',
+                },
+            )
+            self.assertEqual(stat.S_IMODE(env_file.stat().st_mode), 0o600)
+            raw_env = env_file.read_text(encoding="utf-8")
+            self.assertIn("# Keep comment", raw_env)
+            self.assertIn("export TELEGRAM_BOT_TOKEN=999:new_tok", raw_env)
+            self.assertNotIn("stale_111", raw_env)
+            parsed = parse_env_file(env_file)
+            self.assertEqual(parsed["TELEGRAM_BOT_TOKEN"], "999:new_tok")
+            self.assertEqual(parsed["TELEGRAM_CHAT_ID"], "12345678")
+            self.assertEqual(parsed["CUSTOM_NOTE"], 'value with # and "quotes"')
+
+            target_env: dict[str, str] = {"TELEGRAM_CHAT_ID": "override_id"}
+            seed_environ_from_env_file(env_file, target_environ=target_env)
+            self.assertEqual(target_env["TELEGRAM_BOT_TOKEN"], "999:new_tok")
+            self.assertEqual(target_env["TELEGRAM_CHAT_ID"], "override_id")
+
+            with self.assertRaises(ValueError):
+                upsert_env_values(env_file, {"TELEGRAM_CHAT_ID": "bad\nline"})
+            with self.assertRaises(ValueError):
+                upsert_env_values(env_file, {"bad-key": "123"})
+            sym_env = tmp_path / "sym_env"
+            sym_env.symlink_to(env_file)
+            with self.assertRaises(ValueError):
+                upsert_env_values(sym_env, {"TELEGRAM_CHAT_ID": "1"})
+
+            # 3. run_doctor (--json, --offline, permission warnings, masked chat_id, missing token error)
+            spawn_dir = tmp_path / "repos"
+            spawn_dir.mkdir()
+            upsert_env_values(env_file, {"HERDR_SPAWN_ROOTS": str(spawn_dir), "HERDR_SUMMARY_PROVIDER": "off"})
+
+            class FakeDoctorTelegram:
+                def __init__(self, token: str) -> None:
+                    self.token = token
+
+                def get_me(self) -> dict[str, Any]:
+                    return {"id": 55, "username": "doctor_ok_bot"}
+
+            with patch("sys.stdout", new_callable=io.StringIO) as doc_out:
+                rc = run_doctor(
+                    as_json=True,
+                    env_path=env_file,
+                    herdr_factory=lambda: FakeHerdr({"w1:p1": make_snap("w1:p1")}),
+                    telegram_factory=FakeDoctorTelegram,
+                    service_status_fn=lambda: ("ok", "systemd active"),
+                )
+            self.assertEqual(rc, 0)
+            doc_payload = json.loads(doc_out.getvalue())
+            self.assertTrue(doc_payload["ok"])
+            bot_check = next(c for c in doc_payload["checks"] if c["name"] == "bot:default")
+            self.assertEqual(bot_check["status"], "ok")
+            self.assertIn("@doctor_ok_bot", bot_check["detail"])
+            self.assertIn("...5678", bot_check["detail"])
+            self.assertNotIn("12345678", bot_check["detail"])
+
+            # Loose 0644 permissions trigger warn, missing token triggers error (rc=1)
+            empty_env = tmp_path / "empty_env"
+            empty_env.write_text("TELEGRAM_BOT_TOKEN=\n", encoding="utf-8")
+            os.chmod(empty_env, 0o644)
+            with patch("sys.stdout", new_callable=io.StringIO) as bad_out:
+                rc_bad = run_doctor(
+                    as_json=True,
+                    offline=True,
+                    env_path=empty_env,
+                    herdr_factory=lambda: FakeHerdr({}),
+                    service_status_fn=lambda: ("warn", "inactive"),
+                )
+            self.assertEqual(rc_bad, 1)
+            bad_payload = json.loads(bad_out.getvalue())
+            self.assertFalse(bad_payload["ok"])
+            perm_check = next(c for c in bad_payload["checks"] if c["name"] == "env_permissions")
+            self.assertEqual(perm_check["status"], "warn")
+
+            # 4. run_setup interactive pairing flow + non-TTY guard
+            with (
+                patch("sys.stdin.isatty", return_value=False),
+                patch("sys.stderr", new_callable=io.StringIO),
+            ):
+                self.assertEqual(run_setup(env_path=tmp_path / "nty_env"), 2)
+
+            setup_env = tmp_path / "setup_cfg" / "env"
+            setup_state_dir = tmp_path / "setup_state"
+            svc_events: list[str] = []
+
+            class FakeSetupTelegram:
+                sent_messages: list[tuple[str, str]] = []
+                commands_set = False
+
+                def __init__(self, token: str) -> None:
+                    self.token = token
+                    self.poll_count = 0
+
+                def get_me(self) -> dict[str, Any]:
+                    if self.token != "777:valid_setup_tok":
+                        raise RuntimeError("Unauthorized")
+                    return {"id": 77, "username": "pair_me_bot"}
+
+                def set_my_commands(self, commands: Any = None) -> None:
+                    del commands
+                    FakeSetupTelegram.commands_set = True
+
+                def get_updates(self, offset: int, timeout: int = 2) -> list[dict[str, Any]]:
+                    del timeout
+                    self.poll_count += 1
+                    if offset == -1:
+                        return [{"update_id": 500, "message": {"text": "old"}}]
+                    return [
+                        {
+                            "update_id": 501,
+                            "message": {"chat": {"id": -999, "type": "group"}, "text": "/start pair_secret_abc"},
+                        },
+                        {
+                            # Unauthenticated stranger sending bare /start without the one-time pair_code is ignored!
+                            "update_id": 502,
+                            "message": {"chat": {"id": 9999999, "type": "private"}, "text": "/start"},
+                        },
+                        {
+                            "update_id": 503,
+                            "message": {
+                                "chat": {"id": 8675309, "type": "private"},
+                                "text": "/start@pair_me_bot pair_secret_abc",
+                            },
+                        },
+                    ]
+
+                def send_message(self, chat_id: str, text: str, **_: Any) -> int:
+                    FakeSetupTelegram.sent_messages.append((chat_id, text))
+                    return 1
+
+            with patch("sys.stdout", new_callable=io.StringIO) as setup_out:
+                rc_setup = run_setup(
+                    env_path=setup_env,
+                    state_dir=setup_state_dir,
+                    timeout_seconds=10.0,
+                    input_fn=lambda _: "y",
+                    secret_input_fn=lambda _: "777:valid_setup_tok",
+                    telegram_factory=FakeSetupTelegram,
+                    service_status_fn=lambda: ("warn", "inactive"),
+                    stop_service_fn=lambda: svc_events.append("stop"),
+                    start_service_fn=lambda: (svc_events.append("start") or True, "service started"),
+                    pair_code_factory=lambda: "pair_secret_abc",
+                    require_tty=False,
+                )
+            self.assertEqual(rc_setup, 0)
+            self.assertIn("https://t.me/pair_me_bot?start=pair_secret_abc", setup_out.getvalue())
+            self.assertEqual(svc_events, ["stop", "start"])
+            self.assertTrue(FakeSetupTelegram.commands_set)
+            self.assertEqual(stat.S_IMODE(setup_env.stat().st_mode), 0o600)
+            setup_parsed = parse_env_file(setup_env)
+            self.assertEqual(setup_parsed["TELEGRAM_BOT_TOKEN"], "777:valid_setup_tok")
+            self.assertEqual(setup_parsed["TELEGRAM_CHAT_ID"], "8675309")
+            saved_state = BridgeState.load(setup_state_dir / "state.json")
+            self.assertEqual(saved_state.get_last_update_id("default"), 503)
+            self.assertEqual(FakeSetupTelegram.sent_messages[-1][0], "8675309")
+
+            # If a previously active service was stopped and polling hits 409 Conflict, service is restored and 409 hint shown
+            restore_events: list[str] = []
+
+            class ConflictSetupTelegram(FakeSetupTelegram):
+                def get_updates(self, offset: int, timeout: int = 2) -> list[dict[str, Any]]:
+                    del timeout
+                    if offset == -1:
+                        return []
+                    raise RuntimeError("HTTP Error 409: Conflict")
+
+            with (
+                patch("sys.stdout", new_callable=io.StringIO),
+                patch("sys.stderr", new_callable=io.StringIO) as conflict_err,
+            ):
+                rc_conflict = run_setup(
+                    env_path=tmp_path / "conflict_cfg" / "env",
+                    state_dir=setup_state_dir,
+                    timeout_seconds=5.0,
+                    input_fn=lambda _: "y",
+                    secret_input_fn=lambda _: "777:valid_setup_tok",
+                    telegram_factory=ConflictSetupTelegram,
+                    service_status_fn=lambda: ("ok", "systemd active"),
+                    stop_service_fn=lambda: restore_events.append("stop"),
+                    start_service_fn=lambda: (restore_events.append("restore") or True, "restored"),
+                    pair_code_factory=lambda: "code2",
+                    require_tty=False,
+                )
+            self.assertEqual(rc_conflict, 1)
+            self.assertEqual(restore_events, ["stop", "restore"])
+            self.assertIn("another instance is polling this bot", conflict_err.getvalue())
+
+            # 5. install.sh on simulated Darwin (launchd plist) + --uninstall + --uninstall --purge
+            repo_root = Path(__file__).resolve().parent
+            mac_home = tmp_path / "Mac Home"
+            mac_install = mac_home / "share" / "herdr-telegram"
+            mac_bin = mac_home / "bin"
+            mac_cfg = mac_home / "config" / "herdr-telegram"
+            mac_state = mac_home / "state" / "herdr-telegram"
+            mac_launchd = mac_home / "Library" / "LaunchAgents"
+            mac_env = {
+                **os.environ,
+                "HOME": str(mac_home),
+                "HERDR_TELEGRAM_OS_OVERRIDE": "Darwin",
+                "HERDR_TELEGRAM_SKIP_LAUNCHCTL": "1",
+                "HERDR_TELEGRAM_INSTALL_DIR": str(mac_install),
+                "HERDR_TELEGRAM_BIN_DIR": str(mac_bin),
+                "HERDR_TELEGRAM_CONFIG_DIR": str(mac_cfg),
+                "HERDR_TELEGRAM_STATE_DIR": str(mac_state),
+                "HERDR_TELEGRAM_LAUNCHD_DIR": str(mac_launchd),
+            }
+            inst_proc = subprocess.run(
+                ["bash", str(repo_root / "install.sh")],
+                env=mac_env,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=15,
+            )
+            self.assertEqual(inst_proc.returncode, 0, msg=inst_proc.stderr)
+            for cli_name in ("herdr-telegram", "telegram-send", "ts-preview"):
+                self.assertTrue((mac_bin / cli_name).is_symlink())
+            plist_file = mac_launchd / "io.github.jzhao234.herdr-telegram.plist"
+            self.assertTrue(plist_file.is_file())
+            plist_data = plistlib.loads(plist_file.read_bytes())
+            self.assertEqual(plist_data["Label"], "io.github.jzhao234.herdr-telegram")
+            self.assertEqual(plist_data["EnvironmentVariables"]["HERDR_TELEGRAM_CONFIG_DIR"], str(mac_cfg))
+            self.assertEqual(plist_data["EnvironmentVariables"]["HERDR_TELEGRAM_STATE_DIR"], str(mac_state))
+            self.assertEqual(plist_data["StandardOutPath"], f"{mac_state}/bridge.log")
+
+            # Bare --purge without --uninstall is rejected
+            bad_purge = subprocess.run(
+                ["bash", str(repo_root / "install.sh"), "--purge"],
+                env=mac_env,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=10,
+            )
+            self.assertNotEqual(bad_purge.returncode, 0)
+
+            # Replace telegram-send with an external symlink (simulating pipx) to verify --uninstall leaves it untouched!
+            external_bin = tmp_path / "external_tg_send"
+            external_bin.write_text("#!/bin/sh\n", encoding="utf-8")
+            (mac_bin / "telegram-send").unlink()
+            (mac_bin / "telegram-send").symlink_to(external_bin)
+
+            # --uninstall removes bridge symlinks/plist/install dir while preserving mac_cfg and external symlinks
+            uninst_proc = subprocess.run(
+                ["bash", str(repo_root / "install.sh"), "--uninstall"],
+                env=mac_env,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=15,
+            )
+            self.assertEqual(uninst_proc.returncode, 0, msg=uninst_proc.stderr)
+            self.assertFalse(plist_file.exists())
+            self.assertFalse((mac_bin / "herdr-telegram").exists())
+            self.assertTrue((mac_bin / "telegram-send").is_symlink())
+            self.assertFalse(mac_install.exists())
+            self.assertTrue((mac_cfg / "env").is_file())
+
+            # --uninstall --purge removes bridge files cleanly AND never deletes unrelated files if placed in a shared dir!
+            shared_marker = mac_cfg / "other-tool.conf"
+            shared_marker.write_text("keep=1\n", encoding="utf-8")
+            purge_proc = subprocess.run(
+                ["bash", str(repo_root / "install.sh"), "--uninstall", "--purge"],
+                env=mac_env,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=15,
+            )
+            self.assertEqual(purge_proc.returncode, 0, msg=purge_proc.stderr)
+            self.assertFalse((mac_cfg / "env").exists())
+            self.assertFalse((mac_cfg / "config.example.toml").exists())
+            self.assertTrue(shared_marker.is_file())
+            self.assertFalse(mac_state.exists())
 
 
 if __name__ == "__main__":

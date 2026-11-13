@@ -24,7 +24,17 @@ try:
 except ImportError:
     __version__ = "0.2.0"
 
-DEFAULT_TAILSCALE_BIN = "tailscale"
+
+def _resolve_default_tailscale_bin() -> str:
+    if shutil.which("tailscale"):
+        return "tailscale"
+    mac_app_bin = Path("/Applications/Tailscale.app/Contents/MacOS/Tailscale")
+    if mac_app_bin.is_file() and os.access(mac_app_bin, os.X_OK):
+        return str(mac_app_bin)
+    return "tailscale"
+
+
+DEFAULT_TAILSCALE_BIN = _resolve_default_tailscale_bin()
 
 
 def _resolve_default_telegram_send_bin() -> str:

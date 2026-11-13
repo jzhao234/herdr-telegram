@@ -10,6 +10,12 @@ from bridge.agents import (
     AgentRegistry,
     AgentSpec,
 )
+from bridge.cli import (
+    DoctorCheck,
+    run_doctor,
+    run_setup,
+    upsert_env_values,
+)
 from bridge.config import (
     BridgeConfig,
     default_config_dir,
@@ -17,6 +23,7 @@ from bridge.config import (
     default_env_path,
     load_bridge_config,
     parse_env_file,
+    seed_environ_from_env_file,
 )
 from bridge.media import (
     HEIC_HINT_MESSAGE,
@@ -53,6 +60,7 @@ __all__ = [
     "BotChannelSpec",
     "BridgeConfig",
     "DEFAULT_AGENT_REGISTRY",
+    "DoctorCheck",
     "HEIC_HINT_MESSAGE",
     "HERDR_BUILTIN_AGENT_KINDS",
     "ImageMetadata",
@@ -79,6 +87,10 @@ __all__ = [
     "prune_media_dir",
     "read_outbound_image",
     "resolve_media_dir",
+    "run_doctor",
+    "run_setup",
     "save_inbound_image",
+    "seed_environ_from_env_file",
     "sniff_image_bytes",
+    "upsert_env_values",
 ]

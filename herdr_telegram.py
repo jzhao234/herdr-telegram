@@ -41,7 +41,10 @@ from bridge import (
     encode_multipart_formdata,
     format_image_prompt,
     inspect_inbound_image_message,
+    run_doctor,
+    run_setup,
     save_inbound_image,
+    seed_environ_from_env_file,
 )
 from bridge import (
     TELEGRAM_CAPTION_MAX_CHARS as TELEGRAM_CAPTION_MAX_CHARS,
@@ -1930,8 +1933,12 @@ def _find_cli_binary(
     if found:
         return found
     if which_fn is None:
-        for rel in (Path(".local/bin") / name, Path(".cargo/bin") / name):
-            candidate = Path.home() / rel
+        for candidate in (
+            Path.home() / ".local" / "bin" / name,
+            Path.home() / ".cargo" / "bin" / name,
+            Path("/opt/homebrew/bin") / name,
+            Path("/usr/local/bin") / name,
+        ):
             if candidate.exists():
                 return str(candidate)
     return ""
@@ -1948,6 +1955,7 @@ def _default_herdr_binary() -> str:
     for candidate in (
         Path.home() / ".cargo" / "bin" / "herdr",
         Path.home() / ".local" / "bin" / "herdr",
+        Path("/opt/homebrew/bin/herdr"),
         Path("/usr/local/bin/herdr"),
     ):
         if candidate.exists():
@@ -3097,6 +3105,19 @@ class HerdrClient:
         )
         self.agent_registry = agent_registry if agent_registry is not None else DEFAULT_AGENT_REGISTRY
 
+    @staticmethod
+    def _build_child_env() -> dict[str, str]:
+        return {
+            k: v
+            for k, v in os.environ.items()
+            if not (
+                k.startswith("TELEGRAM_")
+                or k.startswith("HERDR_SUMMARY_")
+                or k.endswith("_BOT_TOKEN")
+                or k.endswith("_API_KEY")
+            )
+        }
+
     def _run(
         self,
         args: list[str],
@@ -3109,6 +3130,7 @@ class HerdrClient:
                 text=True,
                 timeout=timeout,
                 check=False,
+                env=self._build_child_env(),
             )
         except subprocess.TimeoutExpired:
             return subprocess.CompletedProcess(
@@ -3374,6 +3396,16 @@ class HerdrClient:
         return status == "sent", formatted
 
 
+BOT_MENU_COMMANDS: tuple[tuple[str, str], ...] = (
+    ("status", "List active Herdr agents"),
+    ("spawn", "Launch a workspace and agent in a repo"),
+    ("read", "Read recent terminal output from a pane"),
+    ("target", "View or pin the default reply agent"),
+    ("key", "Send raw keys (enter, esc, 1..9, y, n, ctrl+c)"),
+    ("help", "Show commands, photo tips, and reply syntax"),
+)
+
+
 class TelegramClient:
     def __init__(self, token: str) -> None:
         self.base_url = f"https://api.telegram.org/bot{token}"
@@ -3561,6 +3593,17 @@ class TelegramClient:
         if text:
             payload["text"] = text
         self._post("answerCallbackQuery", payload)
+
+    def get_me(self) -> dict[str, Any]:
+        res = self._post("getMe", {}, timeout=10.0)
+        info = res.get("result")
+        return dict(info) if isinstance(info, dict) else {}
+
+    def set_my_commands(self, commands: Sequence[tuple[str, str]] = BOT_MENU_COMMANDS) -> None:
+        payload = {
+            "commands": [{"command": cmd, "description": desc} for cmd, desc in commands],
+        }
+        self._post("setMyCommands", payload, timeout=10.0)
 
 
 def format_status_overview(
@@ -5753,6 +5796,17 @@ class BridgeDaemon:
             logger.exception("Unexpected error polling Telegram updates (%s bot): %s", bot_role, exc)
             return None
 
+    def _sync_bot_commands(self) -> None:
+        """Register Telegram's native '/' command picker across configured bot channels."""
+        for bot_role, (tg_client, _, _) in self.bot_channels.items():
+            set_fn = getattr(tg_client, "set_my_commands", None)
+            if not callable(set_fn):
+                continue
+            try:
+                set_fn(BOT_MENU_COMMANDS)
+            except Exception as exc:
+                logger.debug("Could not register command menu for %s bot: %s", bot_role, redact_secrets(str(exc)))
+
     def run_forever(self) -> None:
         bot_names = list(self.bot_channels.keys())
         logger.info(
@@ -5764,6 +5818,7 @@ class BridgeDaemon:
             self.rule_engine.defaults.blocked_delay_seconds,
             self.summarizer.summary_label,
         )
+        self._sync_bot_commands()
         try:
             while True:
                 snapshots: dict[str, AgentSnapshot] = {}
@@ -5798,24 +5853,59 @@ class BridgeDaemon:
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="herdr-telegram",
-        description="Modular two-way Telegram bridge daemon for Herdr terminal coding agents.",
+        description="Modular two-way Telegram bridge daemon and onboarding toolkit for Herdr coding agents.",
     )
     parser.add_argument(
         "--version",
         action="version",
         version=f"%(prog)s {__version__}",
     )
-    parser.parse_args(list(argv) if argv is not None else None)
+    subparsers = parser.add_subparsers(dest="command")
+    subparsers.add_parser("run", help="Run the background Telegram bridge daemon (default)")
+    subparsers.add_parser(
+        "setup",
+        help="Interactive first-run wizard: verify @BotFather token, auto-pair via /start, and start service",
+    )
+    doctor_parser = subparsers.add_parser(
+        "doctor",
+        help="Check config, permissions, Herdr connectivity, Telegram bots, summarizer, and service state",
+    )
+    doctor_parser.add_argument("--json", action="store_true", help="Output machine-readable JSON")
+    doctor_parser.add_argument("--offline", action="store_true", help="Skip live Telegram getMe API checks")
+
+    parsed = parser.parse_args(list(argv) if argv is not None else None)
+    if parsed.command == "setup":
+        return run_setup()
+    if parsed.command == "doctor":
+        return run_doctor(as_json=parsed.json, offline=parsed.offline)
+
+    seed_environ_from_env_file()
+
+    state_dir = default_state_dir()
+    state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    log_path = state_dir / "bridge.log"
+    with contextlib.suppress(OSError):
+        if log_path.is_file() and not log_path.is_symlink() and log_path.stat().st_size > 2 * 1024 * 1024:
+            rotated = state_dir / "bridge.log.1"
+            os.replace(log_path, rotated)
+            os.chmod(rotated, 0o600)
+
+    def _fatal_config_exit() -> int:
+        # Under macOS launchd (KeepAlive.SuccessfulExit=False), exit 0 when unconfigured so launchd parks cleanly
+        return 0 if os.environ.get("XPC_SERVICE_NAME", "").strip() else 2
 
     try:
         cfg = load_bridge_config()
     except Exception as exc:
-        logger.error("Invalid configuration: %s", exc)
-        return 2
+        logger.error("Invalid configuration: %s", redact_secrets(str(exc)))
+        return _fatal_config_exit()
 
     if "default" not in cfg.bots:
-        logger.error("TELEGRAM_BOT_TOKEN is not set. Configure %s and restart.", default_env_path())
-        return 2
+        logger.error(
+            "TELEGRAM_BOT_TOKEN is not set in %s; run 'herdr-telegram setup' to configure and start.",
+            default_env_path(),
+        )
+        return _fatal_config_exit()
 
     defs = cfg.rule_engine.defaults
     for prov_label, prov_val in (
@@ -5832,7 +5922,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 prov_label,
                 prov_val,
             )
-            return 2
+            return _fatal_config_exit()
 
     summarizer = TurnSummarizer(
         model=defs.summary_model,
@@ -5842,8 +5932,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         api_url=cfg.summary_api_url,
     )
 
-    state_dir = default_state_dir()
-    state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
     lock_fd = os.open(state_dir / "bridge.lock", os.O_WRONLY | os.O_CREAT, 0o600)
     lock_file = os.fdopen(lock_fd, "w", encoding="utf-8")
     try:

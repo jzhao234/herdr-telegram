@@ -10,22 +10,30 @@ permissions:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.11", "3.12", "3.13"]
+        include:
+          - os: ubuntu-latest
+            python-version: "3.11"
+          - os: ubuntu-latest
+            python-version: "3.12"
+          - os: ubuntu-latest
+            python-version: "3.13"
+          - os: macos-latest
+            python-version: "3.13"
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: ${{ matrix.python-version }}
       - name: Lint and format check
-        if: matrix.python-version == '3.13'
+        if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.13'
         run: |
           python -m pip install --upgrade pip ruff
-          ruff format --check . telegram-send ts-preview
-          ruff check . telegram-send ts-preview
+          ruff format --check . herdr-telegram telegram-send ts-preview
+          ruff check . herdr-telegram telegram-send ts-preview
           shellcheck install.sh
       - name: Run unit tests
         run: python -m unittest discover -s . -v
@@ -36,5 +44,7 @@ jobs:
           /tmp/pkg-venv/bin/pip install --upgrade pip "setuptools>=77"
           /tmp/pkg-venv/bin/pip install --no-build-isolation --no-deps .
           /tmp/pkg-venv/bin/herdr-telegram --version
+          /tmp/pkg-venv/bin/herdr-telegram doctor --help >/dev/null
+          /tmp/pkg-venv/bin/herdr-telegram setup --help >/dev/null
           /tmp/pkg-venv/bin/telegram-send --version
           /tmp/pkg-venv/bin/ts-preview --version

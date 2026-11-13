@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 import re
 import tomllib
-from collections.abc import Mapping
+from collections.abc import Mapping, MutableMapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -89,6 +89,19 @@ def parse_env_file(path: Path) -> dict[str, str]:
         if clean_key:
             env_vars[clean_key] = _strip_unquoted_comment(val)
     return env_vars
+
+
+def seed_environ_from_env_file(
+    env_path: Path | None = None,
+    *,
+    target_environ: MutableMapping[str, str] | None = None,
+) -> None:
+    """Populate missing environment variables from env file (parity across systemd, launchd, and CLI runs)."""
+    path = env_path if env_path is not None else default_env_path()
+    dest = os.environ if target_environ is None else target_environ
+    for key, val in parse_env_file(path).items():
+        if val and key not in dest:
+            dest[key] = val
 
 
 def _as_str_tuple(val: Any, field_name: str) -> tuple[str, ...]:
