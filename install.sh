@@ -3,13 +3,15 @@ set -euo pipefail
 
 usage() {
   cat <<'EOF'
-Usage: install.sh [--uninstall [--purge]] [--help]
+Usage: install.sh [--install-skill] [--uninstall [--purge]] [--help]
 
 Options:
-  --uninstall   Stop the background service and remove installed binaries/unit files
-                (preserves ~/.config/herdr-telegram/env and config.toml).
-  --purge       With --uninstall, also remove ~/.config/herdr-telegram and state files.
-  -h, --help    Show this help message.
+  --install-skill  Also symlink the bundled herdr-telegram SKILL.md into
+                   ~/.agents/skills and ~/.claude/skills for coding agents.
+  --uninstall      Stop the background service and remove installed binaries/unit files
+                   (preserves ~/.config/herdr-telegram/env and config.toml).
+  --purge          With --uninstall, also remove ~/.config/herdr-telegram and state files.
+  -h, --help       Show this help message.
 EOF
 }
 
@@ -132,6 +134,18 @@ run_uninstall() {
     fi
   done
 
+  local skill_parent
+  for skill_parent in "$AGENTS_SKILL_DIR" "$CLAUDE_SKILL_DIR"; do
+    if [ -L "$skill_parent/herdr-telegram" ]; then
+      link_target="$(readlink "$skill_parent/herdr-telegram" || true)"
+      case "$link_target" in
+        "$install_clean/"* | "$install_clean")
+          rm -f "$skill_parent/herdr-telegram"
+          ;;
+      esac
+    fi
+  done
+
   safe_remove_existing_install_dir "$INSTALL_DIR"
 
   if [ "$purge" -eq 1 ]; then
@@ -149,10 +163,14 @@ run_uninstall() {
 }
 
 main() {
+  INSTALL_SKILL=0
   UNINSTALL=0
   PURGE=0
   while [ "$#" -gt 0 ]; do
     case "$1" in
+      --install-skill)
+        INSTALL_SKILL=1
+        ;;
       --uninstall)
         UNINSTALL=1
         ;;
@@ -176,6 +194,10 @@ main() {
     echo "Error: --purge can only be used together with --uninstall." >&2
     exit 1
   fi
+  if [ "$INSTALL_SKILL" -eq 1 ] && [ "$UNINSTALL" -eq 1 ]; then
+    echo "Error: --install-skill cannot be combined with --uninstall." >&2
+    exit 1
+  fi
 
   OS_NAME="${HERDR_TELEGRAM_OS_OVERRIDE:-$(uname -s)}"
   case "$OS_NAME" in
@@ -196,8 +218,12 @@ main() {
   STATE_DIR="${HERDR_TELEGRAM_STATE_DIR:-$DEFAULT_STATE_DIR}"
   SYSTEMD_USER_DIR="${HERDR_TELEGRAM_SYSTEMD_DIR:-$HOME/.config/systemd/user}"
   LAUNCHD_USER_DIR="${HERDR_TELEGRAM_LAUNCHD_DIR:-$HOME/Library/LaunchAgents}"
+  AGENTS_SKILL_DIR="${HERDR_TELEGRAM_AGENTS_SKILL_DIR:-$HOME/.agents/skills}"
+  CLAUDE_SKILL_DIR="${HERDR_TELEGRAM_CLAUDE_SKILL_DIR:-$HOME/.claude/skills}"
 
   validate_install_dir "$INSTALL_DIR"
+  validate_no_control_chars "HERDR_TELEGRAM_AGENTS_SKILL_DIR" "$AGENTS_SKILL_DIR"
+  validate_no_control_chars "HERDR_TELEGRAM_CLAUDE_SKILL_DIR" "$CLAUDE_SKILL_DIR"
 
   if [ "$UNINSTALL" -eq 1 ]; then
     run_uninstall "$PURGE"
@@ -330,6 +356,19 @@ PY
   if [ ! -f "$CONFIG_DIR/env" ]; then
     install -m 0600 "$SOURCE_DIR/env.example" "$CONFIG_DIR/env"
     CREATED_ENV=1
+  fi
+
+  if [ "$INSTALL_SKILL" -eq 1 ] && [ -f "$SOURCE_DIR/skills/herdr-telegram/SKILL.md" ]; then
+    local skill_dir
+    for skill_dir in "$AGENTS_SKILL_DIR" "$CLAUDE_SKILL_DIR"; do
+      mkdir -p "$skill_dir"
+      if [ -e "$skill_dir/herdr-telegram" ] && [ ! -L "$skill_dir/herdr-telegram" ]; then
+        echo "Warning: skipping $skill_dir/herdr-telegram (non-symlink directory already exists)." >&2
+      else
+        ln -sfn "$INSTALL_DIR/skills/herdr-telegram" "$skill_dir/herdr-telegram"
+      fi
+    done
+    echo "Installed agent skill into $AGENTS_SKILL_DIR/herdr-telegram and $CLAUDE_SKILL_DIR/herdr-telegram."
   fi
 
   echo "Installed herdr-telegram ($INSTALL_DIR) and CLI commands ($BIN_DIR/herdr-telegram, $BIN_DIR/telegram-send, $BIN_DIR/ts-preview)."

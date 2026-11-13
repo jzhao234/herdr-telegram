@@ -4934,6 +4934,13 @@ class HerdrTelegramBridgeTest(unittest.TestCase):
             mac_cfg = mac_home / "config" / "herdr-telegram"
             mac_state = mac_home / "state" / "herdr-telegram"
             mac_launchd = mac_home / "Library" / "LaunchAgents"
+            mac_agents_skills = mac_home / ".agents" / "skills"
+            mac_claude_skills = mac_home / ".claude" / "skills"
+            self.assertTrue((repo_root / "SECURITY.md").is_file())
+            skill_doc = (repo_root / "skills" / "herdr-telegram" / "SKILL.md").read_text(encoding="utf-8")
+            self.assertIn("name: herdr-telegram", skill_doc)
+            self.assertIn("telegram-send", skill_doc)
+            self.assertIn("ts-preview", skill_doc)
             mac_env = {
                 **os.environ,
                 "HOME": str(mac_home),
@@ -4944,9 +4951,11 @@ class HerdrTelegramBridgeTest(unittest.TestCase):
                 "HERDR_TELEGRAM_CONFIG_DIR": str(mac_cfg),
                 "HERDR_TELEGRAM_STATE_DIR": str(mac_state),
                 "HERDR_TELEGRAM_LAUNCHD_DIR": str(mac_launchd),
+                "HERDR_TELEGRAM_AGENTS_SKILL_DIR": str(mac_agents_skills),
+                "HERDR_TELEGRAM_CLAUDE_SKILL_DIR": str(mac_claude_skills),
             }
             inst_proc = subprocess.run(
-                ["bash", str(repo_root / "install.sh")],
+                ["bash", str(repo_root / "install.sh"), "--install-skill"],
                 env=mac_env,
                 capture_output=True,
                 text=True,
@@ -4956,6 +4965,8 @@ class HerdrTelegramBridgeTest(unittest.TestCase):
             self.assertEqual(inst_proc.returncode, 0, msg=inst_proc.stderr)
             for cli_name in ("herdr-telegram", "telegram-send", "ts-preview"):
                 self.assertTrue((mac_bin / cli_name).is_symlink())
+            self.assertTrue((mac_agents_skills / "herdr-telegram").is_symlink())
+            self.assertTrue((mac_claude_skills / "herdr-telegram" / "SKILL.md").is_file())
             plist_file = mac_launchd / "io.github.jzhao234.herdr-telegram.plist"
             self.assertTrue(plist_file.is_file())
             plist_data = plistlib.loads(plist_file.read_bytes())
@@ -4993,6 +5004,8 @@ class HerdrTelegramBridgeTest(unittest.TestCase):
             self.assertEqual(uninst_proc.returncode, 0, msg=uninst_proc.stderr)
             self.assertFalse(plist_file.exists())
             self.assertFalse((mac_bin / "herdr-telegram").exists())
+            self.assertFalse((mac_agents_skills / "herdr-telegram").exists())
+            self.assertFalse((mac_claude_skills / "herdr-telegram").exists())
             self.assertTrue((mac_bin / "telegram-send").is_symlink())
             self.assertFalse(mac_install.exists())
             self.assertTrue((mac_cfg / "env").is_file())
