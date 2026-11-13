@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "herdr-telegram"
+version = "0.2.0"
+description = "Modular two-way Telegram bridge and Tailscale mobile preview helpers for Herdr terminal agents"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.11"
+authors = [{ name = "Junhao Zhao" }]
+keywords = ["herdr", "telegram", "claude-code", "codex", "gemini", "opencode", "tailscale", "terminal", "agents"]
+dependencies = []
+
+[project.scripts]
+herdr-telegram = "herdr_telegram:main"
+telegram-send = "telegram_send:main"
+ts-preview = "ts_preview:main"
+
+[project.urls]
+Homepage = "https://github.com/jzhao234/herdr-telegram"
+Repository = "https://github.com/jzhao234/herdr-telegram"
+Issues = "https://github.com/jzhao234/herdr-telegram/issues"
+
+[tool.setuptools]
+packages = ["bridge"]
+py-modules = ["herdr_telegram", "telegram_send", "ts_preview"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+ignore = ["E501"]

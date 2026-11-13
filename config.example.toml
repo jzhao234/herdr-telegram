@@ -1,0 +1,85 @@
+# Optional modular configuration for herdr-telegram (~/.config/herdr-telegram/config.toml).
+# Keep secrets (bot tokens, API keys, chat IDs) in ~/.config/herdr-telegram/env and reference
+# environment variable names here via `token_env` / `chat_id_env`.
+#
+# All 22 built-in Herdr agent kinds work out of the box (claude, codex, gemini, agy, opencode,
+# cursor, pi, amp, droid, cline, copilot, devin, grok, hermes, kilo, kimi, kiro, maki,
+# mastracode, omp, qodercli, qwen). Add [agents.<name>] tables to customize CLI flags or aliases.
+
+[bridge]
+poll_interval = 2.0
+read_lines = 120
+summary_read_lines = 180
+summary_min_chars = 180
+default_agent = "claude"
+spawn_timeout_ms = 30000
+# spawn_roots = ["~/projects", "~/code"]
+
+# ---------------------------------------------------------------------------
+# Named Telegram bot channels (add as many bots as you want)
+# Primary bot ("default") is loaded automatically from TELEGRAM_BOT_TOKEN.
+# ---------------------------------------------------------------------------
+[bots.ops]
+token_env = "TELEGRAM_OPS_BOT_TOKEN"
+# chat_id_env = "TELEGRAM_OPS_CHAT_ID" # optional; defaults to TELEGRAM_CHAT_ID
+title = "Herdr Ops Bridge"
+
+# [bots.nightly]
+# token_env = "TELEGRAM_NIGHTLY_BOT_TOKEN"
+# title = "Herdr Nightly CI Bridge"
+
+# ---------------------------------------------------------------------------
+# Fallback rules ("the rest") applied when no [[routes]] rule matches
+# ---------------------------------------------------------------------------
+[defaults]
+bot = "default"
+idle_delay_seconds = 90
+blocked_delay_seconds = 30
+fast_track_replies = true
+silent_when_green = false
+hold_on_short_timers = true
+suppress_support_done = true
+include_output = true
+summary_provider = "auto"
+summary_model = ""
+summary_style = ""
+
+# ---------------------------------------------------------------------------
+# Ordered routing & notification rules (first matching rule wins)
+# Non-empty match_* lists are ANDed together; patterns inside a list are ORed.
+# Supports case-insensitive globs on workspace label, agent kind/alias, name, or title.
+# ---------------------------------------------------------------------------
+[[routes]]
+name = "ops"
+match_workspaces = ["prod-support", "production-support", "on-duty", "ops-*", "incident-*"]
+bot = "ops"
+idle_delay_seconds = 0
+silent_when_green = true
+hold_on_short_timers = true
+# summary_style = "- Keep deploy and health-sweep bullets under 20 words."
+
+[[routes]]
+name = "background-sweeps"
+match_names = ["*-nightly*", "*-sweep*"]
+idle_delay_seconds = 180
+silent_when_green = true
+
+# ---------------------------------------------------------------------------
+# Custom agent aliases & TUI adapters for /spawn, model handles, and cleanup
+# ---------------------------------------------------------------------------
+[agents.opus]
+kind = "claude"
+spawn_args = ["--model", "opus"]
+default_model = "opus"
+
+[agents.codex-mini]
+kind = "codex"
+spawn_args = ["--no-alt-screen", "-m", "o4-mini"]
+default_model = "o4-mini"
+
+# Example: customize TUI status-bar regexes for another Herdr agent kind
+# [agents.opencode]
+# kind = "opencode"
+# model_patterns = ['(?i)\bmodel[:\s]+([a-z0-9._/-]+)']
+# prompt_prefixes = [">", "❯"]
+# footer_patterns = ['ctrl\+c to exit']

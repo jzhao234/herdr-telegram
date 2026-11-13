@@ -1,0 +1,17 @@
+[Unit]
+Description=Herdr Telegram Bridge (completion alerts and two-way agent prompts)
+
+[Service]
+Type=simple
+EnvironmentFile=-%h/.config/herdr-telegram/env
+Environment=PYTHONUNBUFFERED=1
+Environment=PATH=%h/.local/bin:%h/.cargo/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/usr/bin/env python3 %h/.local/share/herdr-telegram/herdr_telegram.py
+Restart=on-failure
+RestartPreventExitStatus=2
+RestartSec=5
+NoNewPrivileges=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=default.target
