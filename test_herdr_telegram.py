@@ -3316,7 +3316,8 @@ class HerdrTelegramBridgeTest(unittest.TestCase):
             custom_install_dir = local_home / "share" / "herdr-telegram"
             local_env = {
                 "HOME": str(local_home),
-                "PATH": "/usr/local/bin:/usr/bin:/bin",
+                "PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"),
+                "HERDR_TELEGRAM_OS_OVERRIDE": "Linux",
                 "HERDR_TELEGRAM_INSTALL_DIR": str(custom_install_dir),
                 "HERDR_TELEGRAM_BIN_DIR": str(local_home / "bin"),
                 "HERDR_TELEGRAM_CONFIG_DIR": str(custom_cfg_dir),
@@ -3401,7 +3402,8 @@ class HerdrTelegramBridgeTest(unittest.TestCase):
             remote_home = base / "remote_home"
             remote_env = {
                 "HOME": str(remote_home),
-                "PATH": "/usr/local/bin:/usr/bin:/bin",
+                "PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"),
+                "HERDR_TELEGRAM_OS_OVERRIDE": "Linux",
                 "HERDR_TELEGRAM_REPO_URL": f"file://{origin_repo}",
                 "HERDR_TELEGRAM_INSTALL_DIR": str(remote_home / "share" / "herdr-telegram"),
                 "HERDR_TELEGRAM_BIN_DIR": str(remote_home / "bin"),
@@ -4611,6 +4613,7 @@ class HerdrTelegramBridgeTest(unittest.TestCase):
             env = {
                 **os.environ,
                 "HOME": str(custom_base),
+                "HERDR_TELEGRAM_OS_OVERRIDE": "Linux",
                 "HERDR_TELEGRAM_INSTALL_DIR": str(install_dir),
                 "HERDR_TELEGRAM_BIN_DIR": str(bin_dir),
                 "HERDR_TELEGRAM_CONFIG_DIR": str(cfg_dir),
