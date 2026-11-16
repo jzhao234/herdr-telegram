@@ -14,63 +14,11 @@ Runs as a lightweight user daemon (`systemd --user` on Linux, `launchd` on macOS
 
 ## What It Looks Like on Your Phone
 
-<table>
-<tr>
-<th width="50%">Completed Turn Digest</th>
-<th width="50%">Interactive Blocked Prompt</th>
-</tr>
-<tr>
-<td>
+<p align="center">
+  <img src="assets/telegram-preview.png" alt="herdr-telegram dark-mode iOS Telegram preview showing unattended Done digests, offline Whisper voice replies, tap-to-approve Blocked prompts, and live /target space autocomplete" width="100%" />
+</p>
 
-```text
-✅ Done · Auth (🤖 Opus)
-
-• Admin email 2FA (auth#148 by 🤖): I added email
-  second-factor support for admin step-up actions
-  and blocked self-reset at the store layer,
-  currently undergoing checks before merging.
-
-🟢 gofmt, go vet & build
-🟢 auth#148 lint & race tests (42 passed)
-
-📝 [Note] Emergency CLI password reset remains
-available to server operators over SSH.
-```
-
-</td>
-<td>
-
-```text
-⚠️ Blocked · Auth (🤖 Opus)
-
-Reset route
-
-When an admin resets the password of another admin
-who uses email codes for 2FA, how should the new
-password reach them?
-
-1. Temp password only (Recommended)
-   Console offers a temporary password shared over
-   a separate channel so both factors stay split.
-2. Allow the email link
-   Same as standard users; a compromised mailbox
-   receives both factors after a reset.
-3. Link + clear their 2FA
-   Sends the reset link and forces 2FA re-setup at
-   next sign-in.
-
-[ 1. Temp password only (Recommended) ]
-[ 2. Allow the email link             ]
-[ 3. Link + clear their 2FA           ]
-[ 💬 5. Chat about this               ]
-[ 📖 Read output                      ]
-```
-
-</td>
-</tr>
-</table>
-
-Swipe-reply to any card (or prefix `opus: ship it`) and `herdr-telegram` delivers your prompt straight into that pane, waiting for Herdr to confirm the lifecycle transition so dropped or stalled prompts never fail silently.
+Swipe-reply with text, a voice note, or a screenshot (or prefix `auth: ship it`) and `herdr-telegram` delivers your prompt straight into that pane, waiting for Herdr to confirm the lifecycle transition so dropped or stalled prompts never fail silently.
 
 ---
 
