@@ -59,25 +59,35 @@ from herdr_telegram import (
     HerdrClient,
     TelegramClient,
     TurnSummarizer,
+    VoiceTranscriber,
     _render_digest_sections_html,
     assign_channel_model_handles,
     assign_model_handles,
+    assign_space_command_slugs,
+    build_dynamic_bot_commands,
     build_spawn_agent_name,
     build_transition_keyboard,
     classify_transition,
     clean_terminal_output,
+    command_slug,
     detect_mid_workflow_hold_seconds,
     detect_pane_model,
+    discover_spawn_repos,
     extract_blocked_menu,
     extract_last_agent_turn,
+    extract_spawn_picker_agent,
+    extract_spoken_space_prefix,
     format_display_handle,
     format_done_message,
     format_proactive_message,
+    format_space_label,
     format_status_overview,
     format_transition_message,
+    inspect_inbound_voice_message,
     is_cowork_support,
     is_prod_snapshot,
     is_prod_workspace,
+    ordered_space_snapshots,
     parse_digest_json,
     parse_prod_workspaces,
     parse_slash_command,
@@ -87,7 +97,10 @@ from herdr_telegram import (
     resolve_reply_target,
     resolve_spawn_repo,
     resolve_summary_backend,
+    resolve_voice_backend,
+    sniff_audio_bytes,
     term_tag,
+    workspace_lead_and_reviews,
 )
 
 
@@ -270,6 +283,8 @@ class FakeTelegram:
         self.files: dict[str, bytes] = {}
         self.download_calls: list[str] = []
         self.callbacks: list[tuple[str, str]] = []
+        self.edited: list[dict[str, Any]] = []
+        self.synced_commands: list[tuple[tuple[tuple[str, str], ...], dict[str, Any] | None]] = []
         self.next_id = 100
         self.calls = 0
         self.fail_on_call = fail_on_call
@@ -337,6 +352,31 @@ class FakeTelegram:
 
     def answer_callback_query(self, callback_query_id: str, text: str = "") -> None:
         self.callbacks.append((callback_query_id, text))
+
+    def edit_message_text(
+        self,
+        chat_id: str,
+        message_id: int,
+        text: str,
+        reply_markup: dict[str, Any] | None = None,
+    ) -> bool:
+        self.edited.append(
+            {
+                "chat_id": chat_id,
+                "message_id": message_id,
+                "text": text,
+                "reply_markup": reply_markup,
+            }
+        )
+        return True
+
+    def set_my_commands(
+        self,
+        commands: Any = (),
+        *,
+        scope: dict[str, Any] | None = None,
+    ) -> None:
+        self.synced_commands.append((tuple(commands), scope))
 
 
 class HerdrTelegramBridgeTest(unittest.TestCase):
@@ -5026,6 +5066,629 @@ class HerdrTelegramBridgeTest(unittest.TestCase):
             self.assertFalse((mac_cfg / "config.example.toml").exists())
             self.assertTrue(shared_marker.is_file())
             self.assertFalse(mac_state.exists())
+
+    def test_interactive_slash_command_pickers_and_dynamic_chat_autocomplete(self) -> None:
+        self.assertEqual(command_slug("My-Claude 2!"), "my_claude_2")
+        self.assertEqual(build_dynamic_bot_commands({}), BOT_MENU_COMMANDS)
+        self.assertEqual(extract_spawn_picker_agent(""), "claude")
+        self.assertEqual(extract_spawn_picker_agent("--agent codex"), "codex")
+        self.assertEqual(extract_spawn_picker_agent("-a gemini"), "gemini")
+        self.assertIsNone(extract_spawn_picker_agent("demo-repo"))
+        self.assertIsNone(extract_spawn_picker_agent("--agent bogus"))
+
+        # 1. HTTP-level editMessageText (including 400 'message is not modified') and scoped setMyCommands
+        http_calls: list[tuple[str, dict[str, Any]]] = []
+
+        class EditAndScopeHandler(BaseHTTPRequestHandler):
+            def do_POST(self) -> None:
+                length = int(self.headers.get("Content-Length", "0"))
+                payload = json.loads(self.rfile.read(length).decode("utf-8"))
+                http_calls.append((self.path, payload))
+                if self.path.endswith("/editMessageText") and "unchanged" in payload.get("text", ""):
+                    err_raw = json.dumps(
+                        {"ok": False, "error_code": 400, "description": "Bad Request: message is not modified"}
+                    ).encode("utf-8")
+                    self.send_response(400)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(err_raw)))
+                    self.end_headers()
+                    self.wfile.write(err_raw)
+                    return
+                raw = json.dumps({"ok": True, "result": True}).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+
+            def log_message(self, fmt: str, *args: Any) -> None:
+                del fmt, args
+
+        srv = HTTPServer(("127.0.0.1", 0), EditAndScopeHandler)
+        port = srv.server_address[1]
+        th = threading.Thread(target=srv.serve_forever, daemon=True)
+        th.start()
+        try:
+            real_tg = TelegramClient("999:zzz")
+            real_tg.base_url = f"http://127.0.0.1:{port}/bot999:zzz"
+            self.assertTrue(real_tg.edit_message_text("777", 42, "<b>Updated</b>"))
+            self.assertTrue(real_tg.edit_message_text("777", 42, "unchanged"))
+            real_tg.set_my_commands(BOT_MENU_COMMANDS, scope={"type": "chat", "chat_id": 777})
+            self.assertEqual(http_calls[-1][1]["scope"], {"type": "chat", "chat_id": 777})
+        finally:
+            srv.shutdown()
+            srv.server_close()
+
+        # 2. End-to-end interactive pickers (/target, /read, /key, /spawn) + space-named /target_<space> & /read_<space>
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            root_a = tmp_path / "Personal"
+            root_b = tmp_path / "Work"
+            (root_a / "herdr-telegram" / ".git").mkdir(parents=True)
+            (root_a / "notes-folder").mkdir(parents=True)
+            (root_a / "shared-app" / ".git").mkdir(parents=True)
+            (root_b / "shared-app" / ".git").mkdir(parents=True)
+            (root_a / ".hidden-repo").mkdir(parents=True)
+            outside_dir = tmp_path / "outside-secret"
+            outside_dir.mkdir(parents=True)
+            (root_a / "escape-link").symlink_to(outside_dir)
+
+            discovered = discover_spawn_repos([root_a, root_b])
+            specs = [c.repo_spec for c in discovered]
+            # Git repos sorted before plain folders; duplicate 'shared-app' disambiguated by root; symlink & dotfile excluded
+            self.assertEqual(
+                specs,
+                ["herdr-telegram", "Personal/shared-app", "Work/shared-app", "notes-folder"],
+            )
+
+            # Lead vs review space naming:
+            # - Lead agent -> '<space>' ('migration', 'upgrade', '2fa', 'production_support_skill')
+            # - Single review agent of a model in a space -> '<space>_<model>' ('upgrade_opus')
+            # - 2+ review agents of the same model in a space -> '<space>_<model>_1', '<space>_<model>_2'
+            rich_snaps = {
+                "w15:p1": make_snap(pane_id="w15:p1", workspace_id="w15", workspace_label="Migration", agent="claude"),
+                "w15:p2": make_snap(pane_id="w15:p2", workspace_id="w15", workspace_label="Migration", agent="codex"),
+                "w15:p3": make_snap(pane_id="w15:p3", workspace_id="w15", workspace_label="Migration", agent="codex"),
+                "w22:p1": make_snap(pane_id="w22:p1", workspace_id="w22", workspace_label="Upgrade", agent="agy"),
+                "w22:p5": make_snap(
+                    pane_id="w22:p5",
+                    workspace_id="w22",
+                    workspace_label="Upgrade",
+                    agent="claude",
+                    name="cl-support-w22-p1",
+                ),
+                "w25:p1": make_snap(pane_id="w25:p1", workspace_id="w25", workspace_label="2fa", agent="claude"),
+                "w2E:p1": make_snap(
+                    pane_id="w2E:p1",
+                    workspace_id="w2E",
+                    workspace_label="~",
+                    agent="claude",
+                    title="Production support skill",
+                ),
+            }
+            self.assertEqual(
+                workspace_lead_and_reviews(rich_snaps)[0],
+                ("w15:p1", ["w15:p2", "w15:p3"]),
+            )
+            # Explicit cowork lead name ('cl-lead-*') on :p2 overrides :p1
+            lead_override = {
+                "w30:p1": make_snap(
+                    pane_id="w30:p1", workspace_id="w30", workspace_label="Auth", name="cx-support-auth"
+                ),
+                "w30:p2": make_snap(pane_id="w30:p2", workspace_id="w30", workspace_label="Auth", name="cl-lead-auth"),
+            }
+            self.assertEqual(workspace_lead_and_reviews(lead_override), [("w30:p2", ["w30:p1"])])
+
+            herdr = FakeHerdr(dict(rich_snaps))
+            herdr.footer_outputs["w15:p1"] = "  🤖 Opus 5.5 (high)  |  🧠 72%\n"
+            herdr.footer_outputs["w15:p2"] = "gpt-5.4 high · Context 2% used\n"
+            herdr.footer_outputs["w15:p3"] = "gpt-5.4 high · Context 8% used\n"
+            herdr.footer_outputs["w22:p5"] = "  🤖 Opus 5.5 (high)  |  🧠 14%\n"
+            tg = FakeTelegram()
+            daemon = BridgeDaemon(
+                herdr=herdr,  # type: ignore[arg-type]
+                telegram=tg,  # type: ignore[arg-type]
+                chat_id="777",
+                state_path=tmp_path / "state.json",
+                spawn_roots=[root_a, root_b],
+                async_summaries=False,
+            )
+            try:
+                snapshots = daemon.poll_herdr_once()
+                ordered = ordered_space_snapshots(snapshots)
+                slugs = assign_space_command_slugs(snapshots)
+                self.assertEqual(
+                    slugs,
+                    {
+                        "w15:p1": "migration",
+                        "w15:p2": "migration_gpt5_1",
+                        "w15:p3": "migration_gpt5_2",
+                        "w22:p1": "upgrade",
+                        "w22:p5": "upgrade_opus",
+                        "w25:p1": "2fa",
+                        "w2E:p1": "production_support_skill",
+                    },
+                )
+                self.assertEqual(format_space_label(snapshots["w15:p1"], ordered), "Migration")
+                self.assertEqual(format_space_label(snapshots["w15:p2"], ordered), "Migration_gpt5_1")
+                self.assertEqual(format_space_label(snapshots["w15:p3"], ordered), "Migration_gpt5_2")
+                self.assertEqual(format_space_label(snapshots["w22:p1"], ordered), "Upgrade")
+                self.assertEqual(format_space_label(snapshots["w22:p5"], ordered), "Upgrade_opus")
+                self.assertEqual(format_space_label(snapshots["w2E:p1"], ordered), "~ · Production support skill")
+
+                # Dynamic per-chat '/' menu uses '<space>' for leads and '<space>_<model>[_#]' for reviews
+                self.assertEqual(len(tg.synced_commands), 1)
+                synced_cmds, synced_scope = tg.synced_commands[-1]
+                self.assertEqual(synced_scope, {"type": "chat", "chat_id": 777})
+                cmd_names = [c for c, _ in synced_cmds]
+                self.assertIn("target_migration", cmd_names)
+                self.assertIn("target_migration_gpt5_1", cmd_names)
+                self.assertIn("target_migration_gpt5_2", cmd_names)
+                self.assertIn("target_upgrade", cmd_names)
+                self.assertIn("target_upgrade_opus", cmd_names)
+                self.assertIn("target_2fa", cmd_names)
+                self.assertIn("target_production_support_skill", cmd_names)
+                self.assertIn("read_upgrade_opus", cmd_names)
+                self.assertNotIn("target_opus1", cmd_names)
+                self.assertNotIn("target_clear", cmd_names)
+                for c_name, c_desc in synced_cmds:
+                    self.assertRegex(c_name, r"^[a-z0-9_]{1,32}$")
+                    self.assertTrue(1 <= len(c_desc) <= 256)
+
+                # Polling again with unchanged roster does not re-POST setMyCommands
+                daemon.poll_herdr_once()
+                self.assertEqual(len(tg.synced_commands), 1)
+
+                def send_text(msg_id: int, txt: str) -> None:
+                    daemon.handle_update(
+                        {
+                            "update_id": msg_id,
+                            "message": {
+                                "message_id": msg_id,
+                                "from": {"id": 777},
+                                "chat": {"id": 777, "type": "private"},
+                                "text": txt,
+                            },
+                        },
+                        snapshots,
+                    )
+
+                def tap_button(upd_id: int, msg_id: int, cb_data: str) -> None:
+                    self.assertLessEqual(len(cb_data.encode("utf-8")), 64)
+                    daemon.handle_update(
+                        {
+                            "update_id": upd_id,
+                            "callback_query": {
+                                "id": f"cq_{upd_id}",
+                                "from": {"id": 777},
+                                "message": {
+                                    "message_id": msg_id,
+                                    "chat": {"id": 777, "type": "private"},
+                                },
+                                "data": cb_data,
+                            },
+                        },
+                        snapshots,
+                    )
+
+                # Bare /target renders '<Space>' for leads and '<Space>_<model>[_#]' for review panes
+                send_text(1, "/target")
+                target_card = tg.sent[-1]
+                t_buttons = [btn for row in target_card["reply_markup"]["inline_keyboard"] for btn in row]
+                self.assertEqual(
+                    [b["text"] for b in t_buttons],
+                    [
+                        "📌 Migration",
+                        "📌 Migration_gpt5_1",
+                        "📌 Migration_gpt5_2",
+                        "📌 Upgrade",
+                        "📌 Upgrade_opus",
+                        "📌 2fa",
+                        "📌 ~ · Production support skill",
+                    ],
+                )
+
+                # '/target migration' pins the lead pane w15:p1 directly!
+                send_text(2, "/target migration")
+                self.assertEqual(daemon.state.pinned_target, "w15:p1")
+
+                # Tapping pin:w22:p1 pins Upgrade, syncs target_clear into '/' menu, and edits card in place
+                tap_button(3, target_card["message_id"], "pin:w22:p1")
+                self.assertEqual(daemon.state.pinned_target, "w22:p1")
+                self.assertEqual(tg.callbacks[-1][1], "Pinned Upgrade")
+                edited_buttons = [btn for row in tg.edited[-1]["reply_markup"]["inline_keyboard"] for btn in row]
+                self.assertIn("pin:clear", [b["callback_data"] for b in edited_buttons])
+                self.assertIn("target_clear", [c for c, _ in tg.synced_commands[-1][0]])
+
+                # Dynamic '/target_migration_gpt5_2', '/target_upgrade_opus', '/target_2fa', and prefix routing
+                send_text(4, "/target_migration_gpt5_2")
+                self.assertEqual(daemon.state.pinned_target, "w15:p3")
+                send_text(5, "/target_upgrade_opus")
+                self.assertEqual(daemon.state.pinned_target, "w22:p5")
+                send_text(6, "/target_2fa")
+                self.assertEqual(daemon.state.pinned_target, "w25:p1")
+                send_text(7, "/target_production_support_skill")
+                self.assertEqual(daemon.state.pinned_target, "w2E:p1")
+                send_text(8, "/target_clear")
+                self.assertIsNone(daemon.state.pinned_target)
+                self.assertIn("Cleared pinned", tg.sent[-1]["text"])
+                send_text(9, "migration: ship lead")
+                self.assertEqual(herdr.prompts[-1], ("w15:p1", "ship lead"))
+                send_text(10, "upgrade_opus: audit diff")
+                self.assertEqual(herdr.prompts[-1], ("w22:p5", "audit diff"))
+
+                # Bare /read opens space+review picker; '/read_upgrade_opus' reads w22:p5 directly
+                send_text(11, "/read")
+                r_buttons = [btn for row in tg.sent[-1]["reply_markup"]["inline_keyboard"] for btn in row]
+                self.assertIn("📖 Upgrade_opus", [b["text"] for b in r_buttons])
+                send_text(12, "/read_upgrade_opus")
+                self.assertEqual(herdr.read_calls[-1][0], "w22:p5")
+
+                # Bare /key opens space picker -> kpick:w15:p2 edits into keypad -> kraw:w15:p2:ctrl+c sends key
+                send_text(13, "/key")
+                key_msg = tg.sent[-1]
+                ka_buttons = [btn for row in key_msg["reply_markup"]["inline_keyboard"] for btn in row]
+                self.assertIn("⌨️ Migration_gpt5_1", [b["text"] for b in ka_buttons])
+                tap_button(14, key_msg["message_id"], "kpick:w15:p2")
+                kp_buttons = [btn for row in tg.edited[-1]["reply_markup"]["inline_keyboard"] for btn in row]
+                for btn in kp_buttons:
+                    self.assertLessEqual(len(btn["callback_data"].encode("utf-8")), 64)
+                self.assertIn("kraw:w15:p2:ctrl+c", [b["callback_data"] for b in kp_buttons])
+                self.assertIn("kpick:__list__", [b["callback_data"] for b in kp_buttons])
+                tap_button(15, key_msg["message_id"], "kraw:w15:p2:ctrl+c")
+                self.assertEqual(herdr.keys[-1], ("w15:p2", ["ctrl+c"]))
+
+                # 1-arg '/key upgrade_opus' jumps straight to Upgrade_opus's keypad
+                send_text(16, "/key upgrade_opus")
+                direct_kp = [
+                    btn["callback_data"] for row in tg.sent[-1]["reply_markup"]["inline_keyboard"] for btn in row
+                ]
+                self.assertIn("kraw:w22:p5:enter", direct_kp)
+
+                # Bare /spawn opens repo+agent picker -> spag:codex switches agent -> sprp:codex:<tok> spawns once!
+                send_text(17, "/spawn")
+                sp_msg = tg.sent[-1]
+                sp_btns_initial = [btn for row in sp_msg["reply_markup"]["inline_keyboard"] for btn in row]
+                self.assertIn("spag:codex", [b["callback_data"] for b in sp_btns_initial])
+                tap_button(18, sp_msg["message_id"], "spag:codex")
+                sp_btns_codex = [btn for row in tg.edited[-1]["reply_markup"]["inline_keyboard"] for btn in row]
+                repo_btn = next(b for b in sp_btns_codex if b["text"].endswith("herdr-telegram"))
+                self.assertTrue(repo_btn["callback_data"].startswith("sprp:codex:"))
+                tap_button(19, sp_msg["message_id"], repo_btn["callback_data"])
+                self.assertEqual(len(herdr.created_workspaces), 1)
+                self.assertEqual(herdr.started_agents[-1][1], "codex")
+                # Accidental double-tap on the same spawn picker card is ignored cleanly
+                tap_button(20, sp_msg["message_id"], repo_btn["callback_data"])
+                self.assertEqual(len(herdr.created_workspaces), 1)
+                self.assertIn("already started", tg.callbacks[-1][1])
+            finally:
+                daemon.close()
+
+    def test_voice_note_transcription_spoken_routing_picker_and_backends(self) -> None:
+        # 1. Container magic-byte sniffing & Telegram payload bounds
+        sample_ogg = b"OggS\x00\x02\x00\x00\x00\x00\x00\x00\x00\x00OpusHead"
+        sample_wav = b"RIFF\x24\x00\x00\x00WAVEfmt "
+        sample_m4a = b"\x00\x00\x00\x18ftypM4A \x00\x00\x00\x00"
+        sample_heic = b"\x00\x00\x00\x18ftypheic\x00\x00\x00\x00"
+        sample_mp3 = b"ID3\x04\x00\x00\x00\x00\x00\x00\x00\x00"
+        self.assertEqual(sniff_audio_bytes(sample_ogg), (".ogg", "audio/ogg"))
+        self.assertEqual(sniff_audio_bytes(sample_wav), (".wav", "audio/wav"))
+        self.assertEqual(sniff_audio_bytes(sample_m4a), (".m4a", "audio/mp4"))
+        self.assertIsNone(sniff_audio_bytes(sample_heic))
+        self.assertEqual(sniff_audio_bytes(sample_mp3), (".mp3", "audio/mpeg"))
+        self.assertIsNone(sniff_audio_bytes(b"not-an-audio-file"))
+
+        cand_voice = inspect_inbound_voice_message({"voice": {"file_id": "v1", "file_size": 12000, "duration": 9}})
+        self.assertIsNotNone(cand_voice)
+        self.assertIn(
+            "20 MB",
+            str(inspect_inbound_voice_message({"voice": {"file_id": "v_big", "file_size": 25 * 1024 * 1024}})),
+        )
+        self.assertIn(
+            "10-minute",
+            str(inspect_inbound_voice_message({"voice": {"file_id": "v_long", "duration": 601}})),
+        )
+        cand_doc = inspect_inbound_voice_message(
+            {"document": {"file_id": "d_aud", "mime_type": "audio/mp4", "file_name": "memo.m4a", "file_size": 4096}}
+        )
+        self.assertIsNotNone(cand_doc)
+
+        # 2. Backend resolution priority: local voice-venv -> openai -> groq -> gemini-api -> unconfigured
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            fake_py = tmp_path / "voice-venv" / "bin" / "python"
+            fake_py.parent.mkdir(parents=True)
+            fake_py.write_text(
+                "#!/usr/bin/env python3\n"
+                "import json, os, pathlib, sys\n"
+                "assert sys.argv[1] == '-c'\n"
+                "audio_p, model_n, vocab = sys.argv[3], sys.argv[4], sys.argv[5]\n"
+                "assert pathlib.Path(audio_p).is_file()\n"
+                "assert 'TELEGRAM_BOT_TOKEN' not in os.environ\n"
+                "payload = pathlib.Path(audio_p).read_bytes()\n"
+                "spoken = payload.split(b'|TEXT:', 1)[1].decode('utf-8') if b'|TEXT:' in payload else 'hello world'\n"
+                "print(json.dumps({'text': spoken, 'model': model_n, 'offline': os.environ.get('HF_HUB_OFFLINE', '')}))\n",
+                encoding="utf-8",
+            )
+            fake_py.chmod(0o755)
+
+            self.assertEqual(
+                resolve_voice_backend("auto", env={"HERDR_TELEGRAM_STATE_DIR": str(tmp_path)})[:2],
+                ("local", "large-v3-turbo"),
+            )
+            self.assertEqual(
+                resolve_voice_backend("auto", "local:small.en", local_python=str(fake_py), env={})[:2],
+                ("local", "small.en"),
+            )
+            self.assertEqual(
+                resolve_voice_backend("auto", local_python="", env={"OPENAI_API_KEY": "sk-test"})[:2],
+                ("openai", "gpt-4o-mini-transcribe"),
+            )
+            self.assertEqual(
+                resolve_voice_backend("auto", local_python="", env={"GROQ_API_KEY": "gsk-test"})[:2],
+                ("groq", "whisper-large-v3-turbo"),
+            )
+            self.assertEqual(
+                resolve_voice_backend("auto", local_python="", env={"GEMINI_API_KEY": "gem-test"})[:2],
+                ("gemini-api", "gemini-2.5-flash"),
+            )
+            self.assertEqual(resolve_voice_backend("off", local_python=str(fake_py), env={})[0], "off")
+            self.assertEqual(resolve_voice_backend("auto", local_python="", env={})[0], "unconfigured")
+
+            # Verify scrubbed local faster-whisper subprocess execution & temp file cleanup
+            prev_tok = os.environ.get("TELEGRAM_BOT_TOKEN")
+            os.environ["TELEGRAM_BOT_TOKEN"] = "123456:SECRET_SHOULD_NOT_LEAK"
+            try:
+                local_tr = VoiceTranscriber(provider="local", model="large-v3-turbo", local_python=str(fake_py))
+                heard = local_tr.transcribe_bytes(
+                    sample_ogg + b"|TEXT:Upgrade, run the auth suite.",
+                    workspace_labels=["Upgrade", "Migration"],
+                )
+                self.assertEqual(heard, "Upgrade, run the auth suite.")
+            finally:
+                if prev_tok is None:
+                    os.environ.pop("TELEGRAM_BOT_TOKEN", None)
+                else:
+                    os.environ["TELEGRAM_BOT_TOKEN"] = prev_tok
+
+            # Verify cloud OpenAI multipart HTTP transcription on loopback
+            stt_requests: list[tuple[str, bytes, str]] = []
+
+            class MockSttHandler(BaseHTTPRequestHandler):
+                def do_POST(self) -> None:
+                    n = int(self.headers.get("Content-Length", "0"))
+                    raw_b = self.rfile.read(n)
+                    stt_requests.append((self.path, raw_b, str(self.headers.get("Content-Type") or "")))
+                    resp_b = json.dumps({"text": "transcribed via http"}).encode()
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(resp_b)))
+                    self.end_headers()
+                    self.wfile.write(resp_b)
+
+                def log_message(self, fmt: str, *args: Any) -> None:
+                    del fmt, args
+
+            srv = HTTPServer(("127.0.0.1", 0), MockSttHandler)
+            port = srv.server_address[1]
+            th = threading.Thread(target=srv.serve_forever, daemon=True)
+            th.start()
+            try:
+                http_tr = VoiceTranscriber(
+                    provider="openai",
+                    model="whisper-1",
+                    api_key="sk-local",
+                    api_url=f"http://127.0.0.1:{port}/v1",
+                    local_python="",
+                )
+                self.assertEqual(
+                    http_tr.transcribe_bytes(sample_ogg, workspace_labels=["Upgrade"]),
+                    "transcribed via http",
+                )
+                self.assertTrue(stt_requests[-1][0].endswith("/v1/audio/transcriptions"))
+                self.assertIn("multipart/form-data", stt_requests[-1][2])
+                self.assertIn(b"Upgrade", stt_requests[-1][1])
+            finally:
+                srv.shutdown()
+                srv.server_close()
+
+            # 3. Spoken prefix guardrails: only exact active space/handle followed by ','/':'/';' strips prefix
+            t_ok, b_ok = extract_spoken_space_prefix(
+                "Migration gpt5 2, check the diff.",
+                allowed_tokens=["migration", "migration_gpt5_1", "migration_gpt5_2", "upgrade"],
+                resolve_fn=lambda c: "w15:p3" if c == "migration_gpt5_2" else None,
+            )
+            self.assertEqual((t_ok, b_ok), ("w15:p3", "check the diff."))
+            # Normal sentence starting with a space name WITHOUT pause punctuation is NOT stripped
+            t_no_punct, b_no_punct = extract_spoken_space_prefix(
+                "Upgrade the dependencies in package.json",
+                allowed_tokens=["upgrade"],
+                resolve_fn=lambda c: "w22:p1" if c.lower() == "upgrade" else None,
+            )
+            self.assertIsNone(t_no_punct)
+            self.assertEqual(b_no_punct, "Upgrade the dependencies in package.json")
+            # Leading word 'First,' not in active spaces is NOT stripped
+            t_unknown, _ = extract_spoken_space_prefix(
+                "First, check the logs",
+                allowed_tokens=["upgrade", "migration"],
+                resolve_fn=lambda _: "w22:p1",
+            )
+            self.assertIsNone(t_unknown)
+
+            # 4. End-to-end BridgeDaemon voice workflow: spoken prefix, swipe-reply, unpinned picker, and /spawn audio
+            spawn_root = tmp_path / "Personal"
+            (spawn_root / "herdr-telegram" / ".git").mkdir(parents=True)
+            herdr = FakeHerdr(
+                {
+                    "w15:p1": make_snap(
+                        pane_id="w15:p1", workspace_id="w15", workspace_label="Migration", agent="claude"
+                    ),
+                    "w22:p1": make_snap(pane_id="w22:p1", workspace_id="w22", workspace_label="Upgrade", agent="agy"),
+                    "w22:p5": make_snap(
+                        pane_id="w22:p5",
+                        workspace_id="w22",
+                        workspace_label="Upgrade",
+                        agent="claude",
+                        name="cl-support-w22-p1",
+                    ),
+                }
+            )
+            herdr.footer_outputs["w22:p5"] = "  🤖 Opus 5.5 (high)  |  🧠 14%\n"
+            tg = FakeTelegram()
+            tg.files["v_spoken"] = sample_ogg + b"|TEXT:Upgrade opus: review the error handling"
+            tg.files["v_swipe"] = sample_ogg + b"|TEXT:looks good, merge it"
+            tg.files["v_unpinned"] = sample_ogg + b"|TEXT:check why the staging deploy stalled"
+            tg.files["v_spawn"] = sample_m4a + b"|TEXT:audit the CLI flags"
+
+            daemon = BridgeDaemon(
+                herdr=herdr,  # type: ignore[arg-type]
+                telegram=tg,  # type: ignore[arg-type]
+                chat_id="777",
+                state_path=tmp_path / "state.json",
+                spawn_roots=[spawn_root],
+                async_summaries=False,
+                transcriber=VoiceTranscriber(provider="local", local_python=str(fake_py)),
+            )
+            try:
+                snapshots = daemon.poll_herdr_once()
+
+                # (a) Spoken space prefix routes straight to Upgrade_opus (w22:p5) and echoes transcript in <blockquote>
+                daemon.handle_update(
+                    {
+                        "update_id": 1,
+                        "message": {
+                            "message_id": 50,
+                            "from": {"id": 777},
+                            "chat": {"id": 777, "type": "private"},
+                            "voice": {"file_id": "v_spoken", "file_size": 4096, "duration": 4},
+                        },
+                    },
+                    snapshots,
+                )
+                self.assertEqual(herdr.prompts[-1], ("w22:p5", "review the error handling"))
+                self.assertIn("🎙️ Sent to", tg.sent[-1]["text"])
+                self.assertIn("<blockquote>review the error handling</blockquote>", tg.sent[-1]["text"])
+
+                # (b) Swipe-reply voice note to an alert routes straight to that bound pane
+                daemon.state.record_message(900, "w15:p1")
+                daemon.handle_update(
+                    {
+                        "update_id": 2,
+                        "message": {
+                            "message_id": 51,
+                            "from": {"id": 777},
+                            "chat": {"id": 777, "type": "private"},
+                            "reply_to_message": {"message_id": 900, "text": "✅ Done · Migration (🤖 Claude)"},
+                            "voice": {"file_id": "v_swipe", "file_size": 4096, "duration": 3},
+                        },
+                    },
+                    snapshots,
+                )
+                self.assertEqual(herdr.prompts[-1], ("w15:p1", "looks good, merge it"))
+
+                # (c) Unpinned voice note with no prefix renders one-tap space picker; tapping delivers without re-recording
+                daemon.handle_update(
+                    {
+                        "update_id": 3,
+                        "message": {
+                            "message_id": 52,
+                            "from": {"id": 777},
+                            "chat": {"id": 777, "type": "private"},
+                            "voice": {"file_id": "v_unpinned", "file_size": 4096, "duration": 5},
+                        },
+                    },
+                    snapshots,
+                )
+                picker_msg = tg.sent[-1]
+                self.assertIn("Transcribed voice note:", picker_msg["text"])
+                v_btns = [btn for row in picker_msg["reply_markup"]["inline_keyboard"] for btn in row]
+                up_btn = next(b for b in v_btns if b["text"] == "📌 Upgrade")
+                self.assertLessEqual(len(up_btn["callback_data"].encode()), 64)
+                daemon.handle_update(
+                    {
+                        "update_id": 4,
+                        "callback_query": {
+                            "id": "cq_v1",
+                            "from": {"id": 777},
+                            "message": {"message_id": picker_msg["message_id"], "chat": {"id": 777, "type": "private"}},
+                            "data": up_btn["callback_data"],
+                        },
+                    },
+                    snapshots,
+                )
+                self.assertEqual(herdr.prompts[-1], ("w22:p1", "check why the staging deploy stalled"))
+                # Double-tapping the same voice picker button does not re-send
+                daemon.handle_update(
+                    {
+                        "update_id": 5,
+                        "callback_query": {
+                            "id": "cq_v2",
+                            "from": {"id": 777},
+                            "message": {"message_id": picker_msg["message_id"], "chat": {"id": 777, "type": "private"}},
+                            "data": up_btn["callback_data"],
+                        },
+                    },
+                    snapshots,
+                )
+                self.assertIn("expired or already sent", tg.callbacks[-1][1])
+
+                # (d) Shared audio file with '/spawn herdr-telegram' caption spawns workspace with transcribed prompt
+                daemon.handle_update(
+                    {
+                        "update_id": 6,
+                        "message": {
+                            "message_id": 53,
+                            "from": {"id": 777},
+                            "chat": {"id": 777, "type": "private"},
+                            "caption": "/spawn herdr-telegram",
+                            "audio": {"file_id": "v_spawn", "file_size": 4096, "duration": 4},
+                        },
+                    },
+                    snapshots,
+                )
+                self.assertEqual(len(herdr.created_workspaces), 1)
+                self.assertEqual(herdr.prompts[-1][1], "audit the CLI flags")
+
+                # (e) Doctor reports voice as 'ok' (optional) when not installed under auto, and 'warn' only if forced
+                from bridge.cli import run_doctor
+
+                no_voice_env = tmp_path / "no_voice.env"
+                no_voice_env.write_text(
+                    f"TELEGRAM_BOT_TOKEN=111:aaa\nTELEGRAM_CHAT_ID=777\nHERDR_TELEGRAM_STATE_DIR={tmp_path / 'empty_state'}\n",
+                    encoding="utf-8",
+                )
+                no_voice_env.chmod(0o600)
+                with patch("sys.stdout", new_callable=io.StringIO) as doc_out:
+                    rc_auto = run_doctor(
+                        as_json=True,
+                        offline=True,
+                        env_path=no_voice_env,
+                        herdr_factory=lambda: herdr,
+                        service_status_fn=lambda: ("ok", "active"),
+                    )
+                self.assertEqual(rc_auto, 0)
+                doc_checks = {c["name"]: c for c in json.loads(doc_out.getvalue())["checks"]}
+                self.assertEqual(doc_checks["voice"]["status"], "ok")
+                self.assertIn("optional", doc_checks["voice"]["detail"])
+
+                forced_env = tmp_path / "forced_voice.env"
+                forced_env.write_text(
+                    f"TELEGRAM_BOT_TOKEN=111:aaa\nTELEGRAM_CHAT_ID=777\nHERDR_VOICE_PROVIDER=local\nHERDR_TELEGRAM_STATE_DIR={tmp_path / 'empty_state'}\n",
+                    encoding="utf-8",
+                )
+                forced_env.chmod(0o600)
+                with patch("sys.stdout", new_callable=io.StringIO) as doc_out2:
+                    run_doctor(
+                        as_json=True,
+                        offline=True,
+                        env_path=forced_env,
+                        herdr_factory=lambda: herdr,
+                        service_status_fn=lambda: ("ok", "active"),
+                    )
+                doc_checks2 = {c["name"]: c for c in json.loads(doc_out2.getvalue())["checks"]}
+                self.assertEqual(doc_checks2["voice"]["status"], "warn")
+            finally:
+                daemon.close()
 
 
 if __name__ == "__main__":

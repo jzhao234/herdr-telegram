@@ -3,11 +3,13 @@ set -euo pipefail
 
 usage() {
   cat <<'EOF'
-Usage: install.sh [--install-skill] [--uninstall [--purge]] [--help]
+Usage: install.sh [--install-skill] [--with-voice] [--uninstall [--purge]] [--help]
 
 Options:
   --install-skill  Also symlink the bundled herdr-telegram SKILL.md into
                    ~/.agents/skills and ~/.claude/skills for coding agents.
+  --with-voice     Optional: also install local offline faster-whisper voice transcription
+                   (omitted by default so core install stays zero-dependency).
   --uninstall      Stop the background service and remove installed binaries/unit files
                    (preserves ~/.config/herdr-telegram/env and config.toml).
   --purge          With --uninstall, also remove ~/.config/herdr-telegram and state files.
@@ -154,7 +156,7 @@ run_uninstall() {
     rm -f "$CONFIG_DIR/env" "$CONFIG_DIR/config.toml" "$CONFIG_DIR/config.example.toml"
     rmdir "$CONFIG_DIR" 2>/dev/null || true
     rm -f "$STATE_DIR/state.json" "$STATE_DIR/bridge.lock" "$STATE_DIR/bridge.log" "$STATE_DIR/bridge.log.1"
-    rm -rf "${STATE_DIR:?}/media"
+    rm -rf "${STATE_DIR:?}/media" "${STATE_DIR:?}/voice-venv"
     rmdir "$STATE_DIR" 2>/dev/null || true
     echo "Uninstalled herdr-telegram and purged bridge config/state files in $CONFIG_DIR and $STATE_DIR."
   else
@@ -164,12 +166,16 @@ run_uninstall() {
 
 main() {
   INSTALL_SKILL=0
+  WITH_VOICE=0
   UNINSTALL=0
   PURGE=0
   while [ "$#" -gt 0 ]; do
     case "$1" in
       --install-skill)
         INSTALL_SKILL=1
+        ;;
+      --with-voice)
+        WITH_VOICE=1
         ;;
       --uninstall)
         UNINSTALL=1
@@ -194,8 +200,8 @@ main() {
     echo "Error: --purge can only be used together with --uninstall." >&2
     exit 1
   fi
-  if [ "$INSTALL_SKILL" -eq 1 ] && [ "$UNINSTALL" -eq 1 ]; then
-    echo "Error: --install-skill cannot be combined with --uninstall." >&2
+  if { [ "$INSTALL_SKILL" -eq 1 ] || [ "$WITH_VOICE" -eq 1 ]; } && [ "$UNINSTALL" -eq 1 ]; then
+    echo "Error: --install-skill and --with-voice cannot be combined with --uninstall." >&2
     exit 1
   fi
 
@@ -369,6 +375,10 @@ PY
       fi
     done
     echo "Installed agent skill into $AGENTS_SKILL_DIR/herdr-telegram and $CLAUDE_SKILL_DIR/herdr-telegram."
+  fi
+
+  if [ "$WITH_VOICE" -eq 1 ]; then
+    "$BIN_DIR/herdr-telegram" setup-voice
   fi
 
   echo "Installed herdr-telegram ($INSTALL_DIR) and CLI commands ($BIN_DIR/herdr-telegram, $BIN_DIR/telegram-send, $BIN_DIR/ts-preview)."

@@ -43,6 +43,8 @@ include_output = true
 summary_provider = "auto"
 summary_model = ""
 summary_style = ""
+voice_provider = "auto" # auto, local (faster-whisper via 'herdr-telegram setup-voice'), openai, groq, gemini-api, or off
+voice_model = ""        # e.g. "large-v3-turbo", "small.en", "gpt-4o-mini-transcribe", or "whisper-large-v3-turbo"
 
 # ---------------------------------------------------------------------------
 # Ordered routing & notification rules (first matching rule wins)

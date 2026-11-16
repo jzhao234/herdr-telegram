@@ -46,5 +46,6 @@ jobs:
           /tmp/pkg-venv/bin/herdr-telegram --version
           /tmp/pkg-venv/bin/herdr-telegram doctor --help >/dev/null
           /tmp/pkg-venv/bin/herdr-telegram setup --help >/dev/null
+          /tmp/pkg-venv/bin/herdr-telegram setup-voice --help >/dev/null
           /tmp/pkg-venv/bin/telegram-send --version
           /tmp/pkg-venv/bin/ts-preview --version

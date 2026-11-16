@@ -1,6 +1,6 @@
 ---
 name: herdr-telegram
-description: "Send Telegram messages, screenshots, status sweeps, and Tailscale mobile dev-server preview links to the user from a Herdr agent pane, and inspect inbound Telegram photos saved under .herdr-telegram/media/. Use when the user asks to text or notify them on Telegram, send a screenshot or image to their phone, share a mobile preview URL for a local dev server, or inspect an image sent from Telegram."
+description: "Send Telegram messages, screenshots, status sweeps, and Tailscale mobile dev-server preview links from a Herdr agent pane, inspect inbound Telegram photos/voice prompts, and configure or extend herdr-telegram. Use when the user asks to text/notify them on Telegram, send a screenshot, share a mobile preview URL, inspect an inbound Telegram image, or set up/customize herdr-telegram."
 ---
 
 # herdr-telegram
@@ -58,3 +58,12 @@ ts-preview doctor
 # Tear down a specific port when finished (do not run 'ts-preview reset' unless asked)
 ts-preview off 5173
 ```
+
+## Configuring or Modifying `herdr-telegram`
+
+When the user asks you to set up, diagnose, toggle optional features (such as turning `voice_provider` or `summary_provider` on/off, adding `[bots.<name>]`, `[[routes]]`, or `[agents.<alias>]`), or modify `herdr-telegram` itself:
+
+- Check health safely with `herdr-telegram doctor --offline` (or `--json`); never print raw tokens from `~/.config/herdr-telegram/env`.
+- Edit `~/.config/herdr-telegram/config.toml` (see `config.example.toml` in `~/.config/herdr-telegram/` or `~/.local/share/herdr-telegram/`) to configure routes, bots, custom agents, `summary_provider = "off"`, or `voice_provider = "off"`, then restart the service (`systemctl --user restart herdr-telegram.service` on Linux or `launchctl kickstart -k "gui/$(id -u)/io.github.jzhao234.herdr-telegram"` on macOS).
+- Run `herdr-telegram setup-voice` only when the user wants local offline `faster-whisper` voice note transcription.
+- Read `AGENTS.md` inside the `herdr-telegram` install/repo directory (`~/.local/share/herdr-telegram/AGENTS.md`) for the full module map, configuration reference, extension recipes, and test suite commands.

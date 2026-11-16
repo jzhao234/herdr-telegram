@@ -13,6 +13,9 @@ authors = [{ name = "Junhao Zhao" }]
 keywords = ["herdr", "telegram", "claude-code", "codex", "gemini", "opencode", "tailscale", "terminal", "agents"]
 dependencies = []
 
+[project.optional-dependencies]
+voice = ["faster-whisper>=1.1", "av<17"]
+
 [project.scripts]
 herdr-telegram = "herdr_telegram:main"
 telegram-send = "telegram_send:main"

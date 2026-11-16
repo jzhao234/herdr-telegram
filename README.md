@@ -8,7 +8,7 @@
 
 Modular two-way Telegram bridge and Tailscale mobile preview toolkit for [Herdr](https://github.com/herdrdev/herdr) terminal coding agents (`claude`, `codex`, `gemini`, `agy`, `opencode`, `cursor`, `pi`, `amp`, `droid`, and custom agent profiles).
 
-Runs as a lightweight user daemon (`systemd --user` on Linux, `launchd` on macOS) using pure Python 3.11+ standard library (`tomllib` included, zero pip dependencies). When an agent finishes unattended or pauses on an approval dialog, `herdr-telegram` sends a clean mobile digest or tap-ready option buttons to your phone, and routes your swipe-replies or screenshots right back into that terminal pane.
+Runs as a lightweight user daemon (`systemd --user` on Linux, `launchd` on macOS) using pure Python 3.11+ standard library (`tomllib` included, zero mandatory pip dependencies). When an agent finishes unattended or pauses on an approval dialog, `herdr-telegram` sends a clean mobile digest or tap-ready option buttons to your phone, and routes your swipe-replies, voice notes, or screenshots right back into that terminal pane. Every add-on (LLM summarization, local/cloud voice transcription, multi-bot routing, and Tailscale mobile previews) is optional and can be left off or disabled independently; point any coding agent at [AGENTS.md](AGENTS.md) to customize setup, routes, or code for your workflow.
 
 ---
 
@@ -190,14 +190,15 @@ On startup, `herdr-telegram` automatically registers these commands in Telegram'
 
 | Action | Syntax | What it does |
 | :--- | :--- | :--- |
-| **Swipe-reply** | Swipe any alert or `telegram-send` card | Sends your reply (or photo/screenshot) straight to the bound pane (skips the idle completion wait) |
-| **Model prefix** | `opus: run the auth tests` | Routes text or a photo caption to the `🤖 Opus` pane (case-insensitive; supports `opus2:`, `<workspace>:`, or `w12:p1:`) |
+| **Swipe-reply** | Swipe any alert or `telegram-send` card | Sends your reply, voice note, or photo straight to the bound pane (skips the idle completion wait) |
+| **Space / model prefix** | `upgrade: run the auth tests` | Routes text or a photo caption to the `Upgrade` lead agent (or `upgrade_opus:` / `migration_gpt5_1:` for review agents; `opus:` and `w12:p1:` also work) |
+| **Send voice note** | Hold Telegram's 🎙️ mic button (or share `.ogg`/`.m4a`/`.mp3`/`.wav`) | Transcribes speech locally via `faster-whisper` (or cloud STT), routes via swipe-reply, pinned `/target`, spoken `"Upgrade, ..."` prefix, or a one-tap space picker, and echoes the transcript back |
 | **Send photo / screenshot** | Attach photo, album, or PNG/JPEG/WebP/GIF file | Saves images inside `<workspace>/.herdr-telegram/media` (`0600`, auto-excluded from `git status`), coalesces multi-photo albums into a single prompt, and prompts the target agent to inspect them |
-| **List agents** | `/status` or `/status all` | Shows active panes on this bot channel (or all channels) with one-tap `📖` read buttons |
-| **Read pane** | `/read [model]` | Reads the latest terminal scrollback from a pane |
-| **Pin target** | `/target <model>` | Pins the default pane when multiple agents are open |
-| **Send key** | `/key <model> <key>` | Sends allowed raw keys (`enter`, `esc`, `tab`, `space`, `1..9`, `y`, `n`, `a`, `p`, `ctrl+c`) |
-| **Spawn repo** | `/spawn [-a <agent>] <repo> [prompt]` | Creates a Herdr workspace in `<repo>` under `HERDR_SPAWN_ROOTS` and starts any supported or custom agent (also works as a photo caption!) |
+| **List spaces** | `/status` or `/status all` | Shows active spaces on this bot channel (or all channels) with one-tap `📖` read buttons |
+| **Read space** | `/read [space]` | Opens a one-tap space picker (or reads `<space>` / `/read_<space>` directly) |
+| **Pin target** | `/target [space\|clear]` | Opens a one-tap space picker with `🧹 Clear pin` (and syncs live `/target_<space>` items into Telegram's `/` popup) |
+| **Send key** | `/key [space] [key]` | Opens an interactive inline keypad (`⏎ Enter`, `⎋ Esc`, `⇥ Tab`, `👍 y`, `👎 n`, `1..4`, `🛑 Ctrl+C`) or sends keys directly |
+| **Spawn repo** | `/spawn [[-a <agent>] <repo> [prompt]]` | Opens a tap-to-spawn repo & agent picker across `HERDR_SPAWN_ROOTS`, or launches `<repo>` directly (also works as a photo caption!) |
 
 > **Tip for crisp terminal or log screenshots:** Send PNG or JPEG screenshots via Telegram's **Send as File** option to avoid photo compression. On iPhone, standard Telegram Photos auto-convert to JPEG; raw `.heic` file attachments are rejected with a reminder to resend as a Photo or PNG/JPEG.
 
@@ -210,6 +211,9 @@ On startup, `herdr-telegram` automatically registers these commands in Telegram'
 ```bash
 # Interactive 30-second pairing wizard (@BotFather token + /start auto-discovery + service start)
 herdr-telegram setup
+
+# Optional: install free local offline faster-whisper (large-v3-turbo) for Telegram voice notes
+herdr-telegram setup-voice
 
 # Full diagnostic check (--json and --offline supported)
 herdr-telegram doctor
@@ -265,9 +269,11 @@ ts-preview reset
 
 ---
 
-## Development
+## Development & Agent-Guided Customization
 
-Zero third-party runtime dependencies. Run formatting, lint, shellcheck, and the unit test suite locally:
+Zero mandatory runtime dependencies (`voice` is an optional extra installed only if you run `herdr-telegram setup-voice`). See [AGENTS.md](AGENTS.md) for the full module map, configuration reference, modular on/off switches, and extension playbooks if you want to point Claude Code, Codex, Gemini, or Cursor at this repo to tailor it.
+
+Run formatting, lint, shellcheck, and the unit test suite locally:
 
 ```bash
 uvx ruff format --check . herdr-telegram telegram-send ts-preview

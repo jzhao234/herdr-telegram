@@ -13,6 +13,7 @@ import json
 import logging
 import os
 import re
+import secrets
 import shutil
 import socket
 import subprocess
@@ -29,20 +30,32 @@ from typing import Any
 
 from bridge import (
     DEFAULT_AGENT_REGISTRY,
+    DEFAULT_LOCAL_VOICE_MODEL,
+    MAX_PENDING_VOICE_NOTES,
+    MAX_TRANSCRIPT_PREVIEW_CHARS,
+    PENDING_VOICE_TTL_SECONDS,
+    SUPPORTED_VOICE_PROVIDERS,
     AgentRegistry,
     InboundImageCandidate,
+    InboundVoiceCandidate,
     MediaValidationError,
+    PendingVoiceNote,
     PreparedOutboundMedia,
     ResolvedRoute,
     RouteDefaults,
     RouteRule,
     RuleEngine,
+    VoiceTranscriber,
+    VoiceTranscriptionError,
     __version__,
     encode_multipart_formdata,
+    extract_spoken_space_prefix,
     format_image_prompt,
     inspect_inbound_image_message,
+    inspect_inbound_voice_message,
     run_doctor,
     run_setup,
+    run_setup_voice,
     save_inbound_image,
     seed_environ_from_env_file,
 )
@@ -66,6 +79,12 @@ from bridge import (
 )
 from bridge import (
     read_outbound_image as read_outbound_image,
+)
+from bridge import (
+    resolve_voice_backend as resolve_voice_backend,
+)
+from bridge import (
+    sniff_audio_bytes as sniff_audio_bytes,
 )
 from bridge.config import _default_spawn_roots_from_env
 
@@ -491,6 +510,103 @@ def resolve_spawn_repo(repo_spec: str, roots: Sequence[Path]) -> tuple[Path, str
     return all_matches[0][1], all_matches[0][2]
 
 
+@dataclass(frozen=True)
+class SpawnRepoChoice:
+    repo_spec: str
+    display_label: str
+    token: str
+    is_git: bool
+
+
+def discover_spawn_repos(roots: Sequence[Path], max_repos: int = 16) -> list[SpawnRepoChoice]:
+    """Discover safe, spawnable repositories across configured spawn_roots, preferring git repos first."""
+    raw_items: list[tuple[Path, str, bool]] = []
+    seen_resolved: set[Path] = set()
+    for root in roots:
+        expanded = root.expanduser()
+        try:
+            resolved_root = expanded.resolve()
+        except OSError:
+            continue
+        if not resolved_root.is_dir():
+            continue
+        try:
+            entries = sorted(expanded.iterdir(), key=lambda p: p.name.lower())
+        except OSError:
+            continue
+        for entry in entries:
+            name = entry.name
+            if not name or name.startswith(".") or not re.fullmatch(r"[^\s/\\]+", name):
+                continue
+            try:
+                resolved_entry = entry.resolve()
+            except OSError:
+                continue
+            if (
+                not resolved_entry.is_relative_to(resolved_root)
+                or resolved_entry == resolved_root
+                or not resolved_entry.is_dir()
+                or resolved_entry in seen_resolved
+            ):
+                continue
+            seen_resolved.add(resolved_entry)
+            is_git = (resolved_entry / ".git").exists()
+            raw_items.append((expanded, name, is_git))
+
+    name_counts: dict[str, int] = {}
+    for _, name, _ in raw_items:
+        key = name.lower()
+        name_counts[key] = name_counts.get(key, 0) + 1
+
+    raw_items.sort(key=lambda item: (not item[2], item[1].lower(), item[0].name.lower()))
+    choices: list[SpawnRepoChoice] = []
+    seen_tokens: set[str] = set()
+    for root_path, name, is_git in raw_items:
+        needs_root = name_counts.get(name.lower(), 0) > 1
+        repo_spec = f"{root_path.name}/{name}" if needs_root else name
+        token = hashlib.sha256(f"{root_path.name}/{name}".encode()).hexdigest()[:8]
+        if token in seen_tokens:
+            continue
+        seen_tokens.add(token)
+        choices.append(
+            SpawnRepoChoice(
+                repo_spec=repo_spec,
+                display_label=repo_spec,
+                token=token,
+                is_git=is_git,
+            )
+        )
+        if len(choices) >= max_repos:
+            break
+    return choices
+
+
+def extract_spawn_picker_agent(
+    arg_str: str,
+    default_agent: str = DEFAULT_SPAWN_AGENT,
+    *,
+    allowed_agents: Collection[str] | None = None,
+) -> str | None:
+    """If arg_str omits <repo> (e.g. '' or '--agent codex'), return the validated agent alias; else None."""
+    stripped = arg_str.strip()
+    if not stripped:
+        valid = tuple(allowed_agents) if allowed_agents is not None else ALLOWED_SPAWN_AGENTS
+        cand = default_agent.lower()
+        return cand if cand in valid else (valid[0] if valid else None)
+    try:
+        parse_spawn_args(stripped, default_agent=default_agent, allowed_agents=allowed_agents)
+        return None
+    except ValueError as exc:
+        if str(exc) != "Missing repository name.":
+            return None
+    agent_alias, _, _ = parse_spawn_args(
+        f"{stripped} __picker_repo__",
+        default_agent=default_agent,
+        allowed_agents=allowed_agents,
+    )
+    return agent_alias
+
+
 def build_spawn_agent_name(workspace_label: str, pane_id: str, kind: str) -> str:
     """Build a unique Herdr agent name matching ^[a-z][a-z0-9_-]{0,31}$."""
     slug = re.sub(r"[^a-z0-9_-]+", "-", workspace_label.lower())
@@ -782,11 +898,212 @@ def format_reply_footer(snap_or_handle: AgentSnapshot | str) -> str:
     return f"Swipe-reply or prefix <code>{html.escape(handle)}:</code> to reply."
 
 
+def command_slug(raw: str, max_len: int = 24) -> str:
+    """Normalize a label or handle into a Telegram BotCommand-safe [a-z0-9_] suffix."""
+    slug = re.sub(r"[^a-z0-9_]+", "_", raw.strip().lower())
+    slug = re.sub(r"_{2,}", "_", slug).strip("_")
+    return slug[:max_len].rstrip("_")
+
+
+def _word_bounded_slug(raw: str, max_len: int = 24, max_words: int | None = None) -> str:
+    """Build an underscore slug from alphanumeric words without chopping words mid-token when avoidable."""
+    tokens = re.findall(r"[a-z0-9]+", raw.lower())
+    if not tokens:
+        return ""
+    if max_words is not None:
+        tokens = tokens[:max_words]
+    parts: list[str] = []
+    for tok in tokens:
+        cand = "_".join([*parts, tok])
+        if len(cand) > max_len:
+            if not parts:
+                return tok[:max_len]
+            break
+        parts.append(tok)
+    return "_".join(parts)
+
+
+def _pane_order_key(pane_id: str) -> tuple[int, str]:
+    match = re.search(r":p([0-9]+)$", pane_id, re.IGNORECASE)
+    return (int(match.group(1)), pane_id) if match else (999_999, pane_id)
+
+
+def _pane_model_slug(snap: AgentSnapshot, max_len: int = 10) -> str:
+    raw = snap.model or snap.agent or "agent"
+    return command_slug(raw, max_len=max_len) or "agent"
+
+
+def workspace_lead_and_reviews(
+    snapshots: Mapping[str, AgentSnapshot],
+) -> list[tuple[str, list[str]]]:
+    """Group each workspace into (lead_pane_id, [review_pane_ids...])."""
+    if not snapshots:
+        return []
+    snap_dict = dict(snapshots)
+    by_ws: dict[str, list[str]] = {}
+    for pid, snap in snap_dict.items():
+        ws_key = snap.workspace_id or pid
+        by_ws.setdefault(ws_key, []).append(pid)
+
+    grouped: list[tuple[str, list[str]]] = []
+    for pids in by_ws.values():
+        ordered = sorted(pids, key=_pane_order_key)
+        explicit_leads = [
+            p for p in ordered if snap_dict[p].name and COWORK_LEAD_NAME_RE.match(snap_dict[p].name or "")
+        ]
+        if explicit_leads:
+            lead_pid = explicit_leads[0]
+        else:
+            non_support = [p for p in ordered if not is_cowork_support(snap_dict[p], snap_dict)]
+            lead_pid = non_support[0] if non_support else ordered[0]
+        reviews = [p for p in ordered if p != lead_pid]
+        grouped.append((lead_pid, reviews))
+    return grouped
+
+
+def ordered_space_snapshots(snapshots: Mapping[str, AgentSnapshot]) -> dict[str, AgentSnapshot]:
+    """Order snapshots workspace-by-workspace: lead pane first, followed by its review panes."""
+    out: dict[str, AgentSnapshot] = {}
+    for lead_pid, review_pids in workspace_lead_and_reviews(snapshots):
+        out[lead_pid] = snapshots[lead_pid]
+        for rpid in review_pids:
+            out[rpid] = snapshots[rpid]
+    return out
+
+
+def _base_space_slug(snap: AgentSnapshot, max_len: int = 24) -> str:
+    ws_slug = _word_bounded_slug(snap.workspace_label, max_len=max_len)
+    if not ws_slug and snap.title and not is_generic_shell_title(snap.title):
+        clean_title = strip_em_dashes(redact_secrets(snap.title))
+        ws_slug = _word_bounded_slug(clean_title, max_len=max_len, max_words=3)
+    if not ws_slug:
+        ws_slug = command_slug(snap.workspace_id or snap.pane_id, max_len=max_len) or "space"
+    if ws_slug in {"clear", "none", "off", "unpin"}:
+        ws_slug = f"space_{ws_slug}"[:max_len].rstrip("_")
+    return ws_slug
+
+
+def assign_space_command_slugs(
+    snapshots: Mapping[str, AgentSnapshot],
+    *,
+    max_len: int = 24,
+) -> dict[str, str]:
+    """Assign '<space>' to each workspace's lead agent and '<space>_<model>[_#]' to review agents."""
+    if not snapshots:
+        return {}
+    grouped = workspace_lead_and_reviews(snapshots)
+    assigned: dict[str, str] = {}
+    used: set[str] = set()
+
+    def _claim(raw_cand: str, fallback_tail: str) -> str:
+        cand = raw_cand[:max_len].rstrip("_") or "space"
+        if cand not in used:
+            used.add(cand)
+            return cand
+        tail = command_slug(fallback_tail, max_len=6)
+        if tail:
+            trimmed = cand[: max(1, max_len - 1 - len(tail))].rstrip("_")
+            with_tail = f"{trimmed}_{tail}"[:max_len].rstrip("_")
+            if with_tail not in used:
+                used.add(with_tail)
+                return with_tail
+        idx = 2
+        while True:
+            num_s = str(idx)
+            alt = f"{cand[: max(1, max_len - 1 - len(num_s))].rstrip('_')}_{num_s}"
+            if alt not in used:
+                used.add(alt)
+                return alt
+            idx += 1
+
+    # Pass 1: every workspace lead claims its bare '<space>' slug first
+    lead_slugs: dict[str, str] = {}
+    for lead_pid, _ in grouped:
+        lead_snap = snapshots[lead_pid]
+        base = _base_space_slug(lead_snap, max_len=max_len)
+        lead_slug = _claim(base, "")
+        assigned[lead_pid] = lead_slug
+        lead_slugs[lead_pid] = lead_slug
+
+    # Pass 2: review panes get '<space>_<model>' (or '<space>_<model>_#' if >=2 share that model in the space)
+    for lead_pid, review_pids in grouped:
+        if not review_pids:
+            continue
+        lead_snap = snapshots[lead_pid]
+        lead_slug = lead_slugs[lead_pid]
+        model_counts: dict[str, int] = {}
+        for rpid in review_pids:
+            ms = _pane_model_slug(snapshots[rpid], max_len=10)
+            model_counts[ms] = model_counts.get(ms, 0) + 1
+        model_seen: dict[str, int] = {}
+        for rpid in review_pids:
+            rsnap = snapshots[rpid]
+            ms = _pane_model_slug(rsnap, max_len=10)
+            if model_counts[ms] >= 2:
+                idx = model_seen.get(ms, 0) + 1
+                model_seen[ms] = idx
+                suffix = f"{ms}_{idx}"
+            else:
+                suffix = ms
+            space_budget = max(4, max_len - 1 - len(suffix))
+            space_part = (
+                lead_slug if len(lead_slug) <= space_budget else _base_space_slug(lead_snap, max_len=space_budget)
+            )
+            cand = f"{space_part}_{suffix}"[:max_len].rstrip("_")
+            assigned[rpid] = _claim(cand, rpid.split(":")[-1])
+
+    return {pid: assigned[pid] for pid in ordered_space_snapshots(snapshots) if pid in assigned}
+
+
+def _truncate_words(text: str, max_chars: int = 38) -> str:
+    cleaned = " ".join(text.split())
+    if len(cleaned) <= max_chars:
+        return cleaned
+    cut = cleaned[: max_chars - 1].rsplit(" ", 1)[0]
+    return f"{cut or cleaned[: max_chars - 1]}…"
+
+
+def format_space_label(
+    snap: AgentSnapshot,
+    snapshots: Mapping[str, AgentSnapshot] | None = None,
+) -> str:
+    """Format '<Space>' for a workspace lead and '<Space>_<model>[_#]' for review agents."""
+    ws = " ".join((snap.workspace_label or snap.workspace_id).split())
+    has_named_ws = bool(re.search(r"[A-Za-z0-9]", ws))
+    clean_title = (
+        strip_em_dashes(redact_secrets(snap.title)).strip()
+        if (snap.title and not is_generic_shell_title(snap.title))
+        else ""
+    )
+    if not has_named_ws:
+        base_label = f"{ws} · {_truncate_words(clean_title, 34)}" if clean_title else f"{ws} ({snap.workspace_id})"
+    else:
+        base_label = ws
+
+    if not snapshots:
+        return base_label
+
+    ws_key = snap.workspace_id or snap.pane_id
+    for lead_pid, review_pids in workspace_lead_and_reviews(snapshots):
+        lead_snap = snapshots[lead_pid]
+        if (lead_snap.workspace_id or lead_pid) != ws_key:
+            continue
+        if snap.pane_id == lead_pid or snap.pane_id not in review_pids:
+            return base_label
+        ms = _pane_model_slug(snap, max_len=10)
+        same_model = [rpid for rpid in review_pids if _pane_model_slug(snapshots[rpid], max_len=10) == ms]
+        if len(same_model) >= 2:
+            idx = same_model.index(snap.pane_id) + 1
+            return f"{base_label}_{ms}_{idx}"
+        return f"{base_label}_{ms}"
+    return base_label
+
+
 def resolve_canonical_pane_id(
     candidate: str,
     snapshots: dict[str, AgentSnapshot],
 ) -> str | None:
-    """Resolve a model handle (opus, opus2), pane_id, agent name, or unique workspace label to canonical pane_id."""
+    """Resolve '<space>' (lead), '<space>_<model>[_#]' (review), model handle, pane_id, or name to canonical pane_id."""
     cleaned = candidate.strip()
     if not cleaned:
         return None
@@ -806,6 +1123,50 @@ def resolve_canonical_pane_id(
     for snap in snapshots.values():
         if snap.name and snap.name.lower() == lower:
             return snap.pane_id
+
+    slug_cand = command_slug(lower, max_len=24)
+    grouped = workspace_lead_and_reviews(snapshots)
+    if grouped:
+        lead_ws_matches = [
+            lead_pid
+            for lead_pid, _ in grouped
+            if snapshots[lead_pid].workspace_label.lower() == lower
+            or (slug_cand and _word_bounded_slug(snapshots[lead_pid].workspace_label) == slug_cand)
+        ]
+        if len(lead_ws_matches) == 1:
+            return lead_ws_matches[0]
+        if slug_cand:
+            space_slugs = assign_space_command_slugs(snapshots, max_len=24)
+            exact_space_slug = [pid for pid, sp_slug in space_slugs.items() if sp_slug == slug_cand]
+            if len(exact_space_slug) == 1:
+                return exact_space_slug[0]
+            # Forgiving fallback for '<space>_<agent>[_#]' when agent kind is typed instead of model slug
+            agent_alt_matches: list[str] = []
+            for lead_pid, review_pids in grouped:
+                lead_slug = space_slugs.get(lead_pid, "")
+                ag_counts: dict[str, int] = {}
+                for rpid in review_pids:
+                    ag = command_slug(snapshots[rpid].agent, max_len=10) or "agent"
+                    ag_counts[ag] = ag_counts.get(ag, 0) + 1
+                ag_seen: dict[str, int] = {}
+                for rpid in review_pids:
+                    ag = command_slug(snapshots[rpid].agent, max_len=10) or "agent"
+                    idx = ag_seen.get(ag, 0) + 1
+                    ag_seen[ag] = idx
+                    alt_plain = f"{lead_slug}_{ag}"[:24].rstrip("_")
+                    alt_num = f"{lead_slug}_{ag}_{idx}"[:24].rstrip("_")
+                    if slug_cand == alt_num or (ag_counts[ag] == 1 and slug_cand == alt_plain):
+                        agent_alt_matches.append(rpid)
+            if len(agent_alt_matches) == 1:
+                return agent_alt_matches[0]
+
+    if slug_cand:
+        slug_handle_matches = [s.pane_id for s in snapshots.values() if command_slug(s.friendly_handle) == slug_cand]
+        if len(slug_handle_matches) == 1:
+            return slug_handle_matches[0]
+        slug_name_matches = [s.pane_id for s in snapshots.values() if s.name and command_slug(s.name) == slug_cand]
+        if len(slug_name_matches) == 1:
+            return slug_name_matches[0]
 
     model_matches = [
         s.pane_id for s in snapshots.values() if (s.model and s.model.lower() == lower) or s.agent.lower() == lower
@@ -3396,14 +3757,71 @@ class HerdrClient:
         return status == "sent", formatted
 
 
+CLEAR_TARGET_KEYWORDS = frozenset({"clear", "none", "off", "unpin"})
+
 BOT_MENU_COMMANDS: tuple[tuple[str, str], ...] = (
-    ("status", "List active Herdr agents"),
+    ("status", "List active Herdr spaces"),
     ("spawn", "Launch a workspace and agent in a repo"),
-    ("read", "Read recent terminal output from a pane"),
-    ("target", "View or pin the default reply agent"),
+    ("read", "Read recent terminal output from a space"),
+    ("target", "View or pin the default reply space"),
     ("key", "Send raw keys (enter, esc, 1..9, y, n, ctrl+c)"),
-    ("help", "Show commands, photo tips, and reply syntax"),
+    ("help", "Show commands, voice/photo tips, and reply syntax"),
 )
+
+
+def build_dynamic_bot_commands(
+    chan_snaps: dict[str, AgentSnapshot],
+    pinned_target: str | None = None,
+    *,
+    max_agents: int = 24,
+) -> tuple[tuple[str, str], ...]:
+    """Build per-chat '/' menu commands so typing '/target' or '/read' shows live space and review names."""
+    commands: list[tuple[str, str]] = list(BOT_MENU_COMMANDS)
+    seen_cmds: set[str] = {c for c, _ in commands}
+    enriched = (
+        chan_snaps
+        if (not chan_snaps or all(s.model_handle for s in chan_snaps.values()))
+        else assign_model_handles(chan_snaps)
+    )
+    ordered = ordered_space_snapshots(enriched)
+    space_slugs = assign_space_command_slugs(enriched, max_len=24)
+    active_items = list(ordered.items())[:max_agents]
+
+    def _space_desc(snap: AgentSnapshot) -> str:
+        space_lbl = strip_em_dashes(redact_secrets(format_space_label(snap, ordered))).replace("\n", " ").strip()
+        has_named_ws = bool(re.search(r"[A-Za-z0-9]", snap.workspace_label))
+        if has_named_ws and snap.title and not is_generic_shell_title(snap.title):
+            clean_title = _truncate_words(strip_em_dashes(redact_secrets(snap.title)), 40)
+            if clean_title and clean_title.lower() not in {"claude code", "codex cli", "antigravity", "gemini cli"}:
+                return f"{space_lbl} · {clean_title}"
+        return space_lbl
+
+    for pid, snap in active_items:
+        slug = space_slugs.get(pid, "")
+        if not slug or slug in CLEAR_TARGET_KEYWORDS:
+            continue
+        cmd_name = f"target_{slug}"
+        if cmd_name in seen_cmds or len(cmd_name) > 32:
+            continue
+        seen_cmds.add(cmd_name)
+        prefix = "Pinned:" if snap.pane_id == pinned_target else "Pin"
+        commands.append((cmd_name, f"{prefix} {_space_desc(snap)}"[:256]))
+
+    if pinned_target and "target_clear" not in seen_cmds:
+        seen_cmds.add("target_clear")
+        commands.append(("target_clear", "Clear pinned default reply space"))
+
+    for pid, snap in active_items:
+        slug = space_slugs.get(pid, "")
+        if not slug:
+            continue
+        cmd_name = f"read_{slug}"
+        if cmd_name in seen_cmds or len(cmd_name) > 32:
+            continue
+        seen_cmds.add(cmd_name)
+        commands.append((cmd_name, f"Read {_space_desc(snap)}"[:256]))
+
+    return tuple(commands)
 
 
 class TelegramClient:
@@ -3530,6 +3948,7 @@ class TelegramClient:
         *,
         max_bytes: int = 20 * 1024 * 1024,
         timeout: float = 25.0,
+        media_label: str = "Image",
     ) -> bytes:
         clean_id = file_id.strip()
         if not clean_id:
@@ -3547,7 +3966,7 @@ class TelegramClient:
         file_path = str(info.get("file_path") or "").strip()
         declared_size = int(info.get("file_size") or 0)
         if declared_size > max_bytes:
-            raise MediaValidationError("⚠️ Image exceeds Telegram's 20 MB bot download limit.")
+            raise MediaValidationError(f"⚠️ {media_label} exceeds Telegram's 20 MB bot download limit.")
         if (
             not file_path
             or "\\" in file_path
@@ -3573,7 +3992,7 @@ class TelegramClient:
                         break
                     total += len(chunk)
                     if total > max_bytes:
-                        raise MediaValidationError("⚠️ Image exceeds Telegram's 20 MB bot download limit.")
+                        raise MediaValidationError(f"⚠️ {media_label} exceeds Telegram's 20 MB bot download limit.")
                     chunks.append(chunk)
         except MediaValidationError:
             raise
@@ -3588,21 +4007,60 @@ class TelegramClient:
 
         return b"".join(chunks)
 
+    def send_chat_action(self, chat_id: str, action: str = "typing") -> None:
+        with contextlib.suppress(Exception):
+            self._post("sendChatAction", {"chat_id": chat_id, "action": action}, timeout=5.0)
+
     def answer_callback_query(self, callback_query_id: str, text: str = "") -> None:
         payload: dict[str, Any] = {"callback_query_id": callback_query_id}
         if text:
             payload["text"] = text
         self._post("answerCallbackQuery", payload)
 
+    def edit_message_text(
+        self,
+        chat_id: str,
+        message_id: int,
+        text: str,
+        reply_markup: dict[str, Any] | None = None,
+    ) -> bool:
+        payload: dict[str, Any] = {
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "text": text,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": True,
+        }
+        if reply_markup is not None:
+            payload["reply_markup"] = reply_markup
+        try:
+            self._post("editMessageText", payload)
+            return True
+        except urllib.error.HTTPError as exc:
+            if exc.code == 400 and "message is not modified" in str(exc.msg).lower():
+                return True
+            logger.debug("Telegram editMessageText failed (HTTP %s): %s", exc.code, redact_secrets(str(exc.msg)))
+            return False
+        except (OSError, urllib.error.URLError) as exc:
+            logger.debug("Telegram editMessageText network error: %s", type(exc).__name__)
+            return False
+
     def get_me(self) -> dict[str, Any]:
         res = self._post("getMe", {}, timeout=10.0)
         info = res.get("result")
         return dict(info) if isinstance(info, dict) else {}
 
-    def set_my_commands(self, commands: Sequence[tuple[str, str]] = BOT_MENU_COMMANDS) -> None:
-        payload = {
+    def set_my_commands(
+        self,
+        commands: Sequence[tuple[str, str]] = BOT_MENU_COMMANDS,
+        *,
+        scope: dict[str, Any] | None = None,
+    ) -> None:
+        payload: dict[str, Any] = {
             "commands": [{"command": cmd, "description": desc} for cmd, desc in commands],
         }
+        if scope is not None:
+            payload["scope"] = scope
         self._post("setMyCommands", payload, timeout=10.0)
 
 
@@ -3747,6 +4205,7 @@ class BridgeDaemon:
         agent_registry: AgentRegistry | None = None,
         summary_api_key: str = "",
         summary_api_url: str = "",
+        transcriber: VoiceTranscriber | None = None,
     ) -> None:
         self.agent_registry = agent_registry if agent_registry is not None else DEFAULT_AGENT_REGISTRY
         normalized_agent = default_agent.strip().lower()
@@ -3800,6 +4259,7 @@ class BridgeDaemon:
         self.idle_delay_seconds = float(idle_delay_seconds)
         self.blocked_delay_seconds = float(blocked_delay_seconds)
         self.summarizer = summarizer if summarizer is not None else TurnSummarizer()
+        self.transcriber = transcriber if transcriber is not None else VoiceTranscriber()
         self._summary_api_key = summary_api_key
         self._summary_api_url = summary_api_url
         self._route_summarizers: dict[tuple[str, str], TurnSummarizer] = {}
@@ -3837,7 +4297,10 @@ class BridgeDaemon:
         self.pane_models: dict[tuple[str, str], tuple[str, int]] = {}
         self.pane_agent_aliases: dict[tuple[str, str], str] = {}
         self.consumed_approvals: set[tuple[str, str, int]] = set()
+        self.consumed_spawn_pickers: set[tuple[str, int]] = set()
+        self._synced_chat_commands: dict[str, tuple[tuple[str, str], ...]] = {}
         self.pending_albums: dict[tuple[str, str], PendingAlbum] = {}
+        self.pending_voice_notes: dict[str, PendingVoiceNote] = {}
         self._executor: ThreadPoolExecutor | None = None
         self._poll_executor: ThreadPoolExecutor | None = None
         self._summary_futures: list[SummaryJobSpec] = []
@@ -3903,8 +4366,20 @@ class BridgeDaemon:
         raw_target: str,
         snapshots: dict[str, AgentSnapshot],
         bot_role: str,
+        *,
+        prefer_space_slug: bool = False,
     ) -> str | None:
         chan = self._channel_snapshots(snapshots, bot_role)
+        if prefer_space_slug:
+            slug_key = command_slug(raw_target, max_len=24)
+            if slug_key:
+                for pid, sp_slug in assign_space_command_slugs(chan, max_len=24).items():
+                    if sp_slug == slug_key:
+                        return pid
+                if len(self.bot_channels) > 1:
+                    for pid, sp_slug in assign_space_command_slugs(snapshots, max_len=24).items():
+                        if sp_slug == slug_key:
+                            return pid
         found = resolve_canonical_pane_id(raw_target, chan)
         if found is not None or len(self.bot_channels) <= 1:
             return found
@@ -4572,6 +5047,7 @@ class BridgeDaemon:
                         tracked.fast_track_done = False
 
         self.flush_pending_albums(snapshots)
+        self._sync_dynamic_bot_commands(snapshots)
         self.initialized = True
         return snapshots
 
@@ -4623,6 +5099,7 @@ class BridgeDaemon:
         bot_role: str = "default",
         ack_emoji: str = "➡️",
         cleanup_on_reject: Sequence[Path] = (),
+        transcript_preview: str = "",
     ) -> None:
         tg_client, active_chat_id = self._channel_context(bot_role)
         pre_prompt_snap = snapshots.get(target)
@@ -4650,9 +5127,16 @@ class BridgeDaemon:
         pane_target = snap.pane_id if snap is not None else target
         if prompt_status == "sent":
             self._arm_fast_track_done(pane_target, pre_prompt_snap)
+            if transcript_preview:
+                clean_prev = strip_em_dashes(redact_secrets(transcript_preview)).strip()
+                if len(clean_prev) > MAX_TRANSCRIPT_PREVIEW_CHARS:
+                    clean_prev = f"{clean_prev[: MAX_TRANSCRIPT_PREVIEW_CHARS - 1].rstrip()}…"
+                ack_html = f"{ack_emoji} Sent to <b>{html.escape(label)}</b>:\n<blockquote>{html.escape(clean_prev)}</blockquote>"
+            else:
+                ack_html = f"{ack_emoji} Sent to <b>{html.escape(label)}</b>."
             sent_id = tg_client.send_message(
                 active_chat_id,
-                f"{ack_emoji} Sent to <b>{html.escape(label)}</b>.",
+                ack_html,
                 reply_to_message_id=msg_id,
             )
             if sent_id is not None:
@@ -4815,6 +5299,249 @@ class BridgeDaemon:
             cleanup_on_reject=saved_paths,
         )
 
+    def _prune_pending_voice_notes(self) -> None:
+        if not self.pending_voice_notes:
+            return
+        now_mono = self.clock()
+        expired = [
+            tok
+            for tok, item in self.pending_voice_notes.items()
+            if (now_mono - item.created_at) > PENDING_VOICE_TTL_SECONDS
+        ]
+        for tok in expired:
+            self.pending_voice_notes.pop(tok, None)
+        while len(self.pending_voice_notes) >= MAX_PENDING_VOICE_NOTES:
+            oldest_tok = next(iter(self.pending_voice_notes))
+            self.pending_voice_notes.pop(oldest_tok, None)
+
+    def _render_voice_picker(
+        self,
+        token: str,
+        transcript: str,
+        chan_snaps: dict[str, AgentSnapshot],
+    ) -> tuple[str, dict[str, Any]]:
+        clean_prev = strip_em_dashes(redact_secrets(transcript)).strip()
+        if len(clean_prev) > MAX_TRANSCRIPT_PREVIEW_CHARS:
+            clean_prev = f"{clean_prev[: MAX_TRANSCRIPT_PREVIEW_CHARS - 1].rstrip()}…"
+        ordered = ordered_space_snapshots(chan_snaps)
+        rows = [
+            [
+                {
+                    "text": f"📌 {format_space_label(snap, ordered)}",
+                    "callback_data": f"vsend:{token}:{snap.pane_id}",
+                }
+            ]
+            for snap in list(ordered.values())[:16]
+        ]
+        rows.append([{"text": "❌ Cancel", "callback_data": f"vsend:{token}:cancel"}])
+        text = (
+            f"🎙️ <b>Transcribed voice note:</b>\n"
+            f"<blockquote>{html.escape(clean_prev)}</blockquote>\n"
+            f"Tap a space below to send this prompt:"
+        )
+        return text, {"inline_keyboard": rows}
+
+    def _deliver_voice_message(
+        self,
+        candidate: InboundVoiceCandidate,
+        caption: str,
+        reply_to_message: dict[str, Any] | None,
+        msg_id: int,
+        snapshots: dict[str, AgentSnapshot],
+        *,
+        bot_role: str = "default",
+    ) -> None:
+        tg_client, active_chat_id = self._channel_context(bot_role)
+        caption_cmd = parse_slash_command(caption) if caption else None
+        if caption_cmd is not None and caption_cmd[0] != "spawn":
+            tg_client.send_message(
+                active_chat_id,
+                f"❌ Slash command <code>/{html.escape(caption_cmd[0])}</code> cannot be combined with a voice/audio clip "
+                f"(only <code>/spawn</code> supports audio captions).",
+                reply_to_message_id=msg_id,
+            )
+            return
+
+        action_fn = getattr(tg_client, "send_chat_action", None)
+        if callable(action_fn):
+            action_fn(active_chat_id, "typing")
+
+        try:
+            raw_bytes = tg_client.download_file(candidate.file_id, media_label="Voice/audio clip")
+            ws_labels = [s.workspace_label for s in snapshots.values()]
+            transcript = strip_em_dashes(
+                self.transcriber.transcribe_bytes(raw_bytes, workspace_labels=ws_labels)
+            ).strip()
+        except MediaValidationError as exc:
+            tg_client.send_message(
+                active_chat_id,
+                html.escape(redact_secrets(str(exc))),
+                reply_to_message_id=msg_id,
+            )
+            return
+        except VoiceTranscriptionError as exc:
+            tg_client.send_message(
+                active_chat_id,
+                f"🎙️ {html.escape(redact_secrets(str(exc)))}",
+                reply_to_message_id=msg_id,
+            )
+            return
+        except Exception as exc:
+            safe_err = redact_secrets(str(exc))
+            logger.warning("Failed downloading/transcribing Telegram voice note on %s bot: %s", bot_role, safe_err)
+            tg_client.send_message(
+                active_chat_id,
+                f"❌ Failed to process voice note: <code>{html.escape(safe_err)}</code>",
+                reply_to_message_id=msg_id,
+            )
+            return
+
+        if not transcript:
+            tg_client.send_message(
+                active_chat_id,
+                "🎙️ Could not hear any speech in that voice note.",
+                reply_to_message_id=msg_id,
+            )
+            return
+
+        if caption_cmd is not None:
+            spawn_args = f"{caption_cmd[1].strip()} {transcript}".strip() if caption_cmd[1].strip() else transcript
+            self._handle_spawn(spawn_args, msg_id, snapshots, bot_role=bot_role)
+            return
+
+        if reply_to_message:
+            self._ingest_proactive_targets()
+
+        chan_snaps = self._channel_snapshots(snapshots, bot_role)
+        multi_bot = len(self.bot_channels) > 1
+        fallback_snaps = snapshots if multi_bot else None
+
+        # 1. Swipe-reply binding
+        if reply_to_message:
+            reply_target, _ = resolve_reply_target(
+                "",
+                reply_to_message,
+                self.state,
+                chan_snaps,
+                bot_role=bot_role,
+                fallback_snapshots=fallback_snaps,
+                allow_empty_body=True,
+            )
+            if reply_target:
+                combined = f"{caption}\n\n{transcript}".strip() if caption else transcript
+                self._send_prompt_to_target(
+                    reply_target,
+                    combined,
+                    msg_id,
+                    snapshots,
+                    bot_role=bot_role,
+                    ack_emoji="🎙️",
+                    transcript_preview=combined,
+                )
+                return
+
+        # 2. Explicit caption prefix on shared audio files ('upgrade: context')
+        if caption:
+            cap_target, cap_body = resolve_reply_target(
+                caption,
+                None,
+                BridgeState(),
+                chan_snaps,
+                bot_role=bot_role,
+                fallback_snapshots=fallback_snaps,
+                allow_empty_body=True,
+            )
+            if cap_target and cap_body != caption:
+                combined = f"{cap_body}\n\n{transcript}".strip() if cap_body else transcript
+                self._send_prompt_to_target(
+                    cap_target,
+                    combined,
+                    msg_id,
+                    snapshots,
+                    bot_role=bot_role,
+                    ack_emoji="🎙️",
+                    transcript_preview=combined,
+                )
+                return
+
+        # 3. Spoken space prefix at the start of the voice note ('Upgrade, run the auth tests')
+        pool_for_tokens = snapshots if multi_bot else chan_snaps
+        allowed_tokens = [
+            *assign_space_command_slugs(pool_for_tokens).values(),
+            *(s.workspace_label for s in pool_for_tokens.values()),
+            *(s.friendly_handle for s in pool_for_tokens.values()),
+        ]
+        spoken_target, spoken_body = extract_spoken_space_prefix(
+            transcript,
+            allowed_tokens=allowed_tokens,
+            resolve_fn=lambda cand: self._resolve_in_channel(cand, snapshots, bot_role),
+        )
+        if spoken_target:
+            combined = f"{caption}\n\n{spoken_body}".strip() if caption else spoken_body
+            self._send_prompt_to_target(
+                spoken_target,
+                combined,
+                msg_id,
+                snapshots,
+                bot_role=bot_role,
+                ack_emoji="🎙️",
+                transcript_preview=combined,
+            )
+            return
+
+        # 4. Pinned target or single active pane in channel
+        default_target, _ = resolve_reply_target(
+            "",
+            None,
+            self.state,
+            chan_snaps,
+            bot_role=bot_role,
+            fallback_snapshots=fallback_snaps,
+            allow_empty_body=True,
+        )
+        combined_full = f"{caption}\n\n{transcript}".strip() if caption else transcript
+        if default_target:
+            self._send_prompt_to_target(
+                default_target,
+                combined_full,
+                msg_id,
+                snapshots,
+                bot_role=bot_role,
+                ack_emoji="🎙️",
+                transcript_preview=combined_full,
+            )
+            return
+
+        # 5. Unpinned with 2+ spaces: preserve the transcript and show a one-tap space picker!
+        if chan_snaps:
+            self._prune_pending_voice_notes()
+            vtok = secrets.token_hex(4)
+            while vtok in self.pending_voice_notes:
+                vtok = secrets.token_hex(4)
+            self.pending_voice_notes[vtok] = PendingVoiceNote(
+                token=vtok,
+                bot_role=bot_role,
+                msg_id=msg_id,
+                transcript=combined_full,
+                created_at=self.clock(),
+            )
+            vp_text, vp_markup = self._render_voice_picker(vtok, combined_full, chan_snaps)
+            tg_client.send_message(
+                active_chat_id,
+                vp_text,
+                reply_markup=vp_markup,
+                reply_to_message_id=msg_id,
+            )
+            return
+
+        clean_prev = strip_em_dashes(redact_secrets(combined_full)).strip()[:MAX_TRANSCRIPT_PREVIEW_CHARS]
+        tg_client.send_message(
+            active_chat_id,
+            f"🎙️ <b>Transcribed voice note:</b>\n<blockquote>{html.escape(clean_prev)}</blockquote>\n"
+            f"No active spaces right now. Use <code>/spawn</code> to start one.",
+            reply_to_message_id=msg_id,
+        )
+
     def handle_update(
         self,
         update: dict[str, Any],
@@ -4835,7 +5562,8 @@ class BridgeDaemon:
         raw_text = str(msg.get("text") or "").strip()
         raw_caption = str(msg.get("caption") or "").strip()
         media_info = inspect_inbound_image_message(msg)
-        if not raw_text and media_info is None:
+        voice_info = inspect_inbound_voice_message(msg) if media_info is None else None
+        if not raw_text and media_info is None and voice_info is None:
             return
 
         slash_cmd = parse_slash_command(raw_text) if raw_text else None
@@ -4844,6 +5572,7 @@ class BridgeDaemon:
         if not active_chat_id:
             if (
                 media_info is None
+                and voice_info is None
                 and slash_cmd
                 and slash_cmd[0] in ("start", "id")
                 and chat.get("type") in (None, "private")
@@ -4889,6 +5618,25 @@ class BridgeDaemon:
             )
             return
 
+        if isinstance(voice_info, str):
+            tg_client.send_message(
+                active_chat_id,
+                html.escape(voice_info),
+                reply_to_message_id=msg_id,
+            )
+            return
+
+        if isinstance(voice_info, InboundVoiceCandidate):
+            self._deliver_voice_message(
+                voice_info,
+                raw_caption,
+                msg.get("reply_to_message"),
+                msg_id,
+                snapshots,
+                bot_role=bot_role,
+            )
+            return
+
         if isinstance(media_info, InboundImageCandidate):
             media_group_id = str(msg.get("media_group_id") or "").strip()
             if media_group_id:
@@ -4928,6 +5676,13 @@ class BridgeDaemon:
 
         if slash_cmd:
             cmd, cmd_args = slash_cmd
+            from_menu_slug = False
+            if cmd.startswith("target_") and len(cmd) > len("target_") and not cmd_args:
+                cmd, cmd_args = "target", cmd[len("target_") :]
+                from_menu_slug = True
+            elif cmd.startswith("read_") and len(cmd) > len("read_") and not cmd_args:
+                cmd, cmd_args = "read", cmd[len("read_") :]
+                from_menu_slug = True
 
             if cmd in ("start", "help"):
                 heading = html.escape(self._channel_title(bot_role))
@@ -4937,19 +5692,20 @@ class BridgeDaemon:
                     else (
                         "list default-channel agents (<code>/status all</code> for all)"
                         if multi_bot
-                        else "list active agents"
+                        else "list active spaces"
                     )
                 )
                 tg_client.send_message(
                     active_chat_id,
                     f"<b>{heading}</b>\n"
                     f"• <code>/status</code>: {status_hint}\n"
-                    "• <code>/spawn [--agent &lt;agent&gt;] &lt;repo&gt; [prompt]</code>: launch a new workspace and agent\n"
-                    "• <code>/read [model]</code>: read recent terminal lines (e.g. <code>/read opus</code> or <code>/read opus2</code>)\n"
-                    "• <code>/target &lt;model&gt;</code>: pin default reply target\n"
-                    "• <code>/key &lt;model&gt; enter</code>: send raw keys (enter, esc, 1..9, y, n, p, ctrl+c)\n"
-                    "• Send a photo or image file (swipe-reply, caption <code>model: prompt</code>, or <code>/spawn ...</code>)\n"
-                    "• Swipe-reply to any alert or prefix with <code>model: prompt</code> (e.g. <code>opus:</code> or <code>opus2:</code>).",
+                    "• <code>/spawn [[--agent &lt;agent&gt;] &lt;repo&gt; [prompt]]</code>: pick a repo or launch directly\n"
+                    "• <code>/read [space]</code>: pick a space or read recent terminal lines\n"
+                    "• <code>/target [space|clear]</code>: pick, pin, or clear default reply space\n"
+                    "• <code>/key [space] [key]</code>: open inline keypad or send raw keys\n"
+                    "• Hold 🎙️ mic to send a voice note (swipe-reply, pinned <code>/target</code>, or say <code>space, prompt</code>)\n"
+                    "• Send a photo or image file (swipe-reply, caption <code>space: prompt</code>, or <code>/spawn ...</code>)\n"
+                    "• Swipe-reply to any alert or prefix with <code>space: prompt</code> (e.g. <code>upgrade:</code> or <code>opus:</code>).",
                 )
                 return
 
@@ -4975,14 +5731,15 @@ class BridgeDaemon:
                         f"No active {html.escape(bot_role)} agents found. "
                         f"Use <code>/status all</code> to see all channels."
                     )
+                ordered_view = ordered_space_snapshots(view_snaps)
                 keyboard_rows = [
                     [
                         {
-                            "text": f"📖 {snap.header_label}",
+                            "text": f"📖 {format_space_label(snap, ordered_view)}",
                             "callback_data": f"read:{snap.pane_id}",
                         }
                     ]
-                    for snap in list(view_snaps.values())[:8]
+                    for snap in list(ordered_view.values())[:24]
                 ]
                 markup = {"inline_keyboard": keyboard_rows} if keyboard_rows else None
                 tg_client.send_message(
@@ -4999,29 +5756,40 @@ class BridgeDaemon:
 
             if cmd == "target":
                 if not cmd_args:
-                    pinned = self.state.get_pinned_target(bot_role)
-                    pinned_snap = snapshots.get(pinned) if pinned else None
-                    pinned_display = (
-                        f"<b>{html.escape(pinned_snap.header_label)}</b>"
-                        if pinned_snap
-                        else f"<code>{html.escape(pinned or 'none')}</code>"
-                    )
-                    tg_client.send_message(
-                        active_chat_id,
-                        f"Current pinned target: {pinned_display}\nUsage: <code>/target opus</code>",
-                    )
+                    picker_text, picker_markup = self._render_target_picker(snapshots, bot_role)
+                    tg_client.send_message(active_chat_id, picker_text, reply_markup=picker_markup)
                     return
                 raw_target = cmd_args.strip()
-                canonical = self._resolve_in_channel(raw_target, snapshots, bot_role)
+                if raw_target.lower() in CLEAR_TARGET_KEYWORDS:
+                    self.state.set_pinned_target(None, bot_role=bot_role)
+                    self.state.save(self.state_path)
+                    self._sync_dynamic_bot_commands(snapshots)
+                    tg_client.send_message(active_chat_id, "🧹 Cleared pinned reply target.")
+                    return
+                canonical = self._resolve_in_channel(
+                    raw_target,
+                    snapshots,
+                    bot_role,
+                    prefer_space_slug=from_menu_slug,
+                )
                 if not canonical or (snapshots and canonical not in snapshots):
-                    tg_client.send_message(
-                        active_chat_id,
-                        f"❌ Unknown or inactive agent target <code>{html.escape(raw_target)}</code>.",
-                        reply_to_message_id=msg_id,
-                    )
+                    err_line = f"❌ Unknown or inactive space <code>{html.escape(raw_target)}</code>."
+                    if chan_snaps:
+                        picker_text, picker_markup = self._render_target_picker(
+                            snapshots, bot_role, prefix_html=err_line
+                        )
+                        tg_client.send_message(
+                            active_chat_id,
+                            picker_text,
+                            reply_markup=picker_markup,
+                            reply_to_message_id=msg_id,
+                        )
+                    else:
+                        tg_client.send_message(active_chat_id, err_line, reply_to_message_id=msg_id)
                     return
                 self.state.set_pinned_target(canonical, bot_role=bot_role)
                 self.state.save(self.state_path)
+                self._sync_dynamic_bot_commands(snapshots)
                 pinned_snap = snapshots.get(canonical)
                 pinned_label = pinned_snap.header_label if pinned_snap else canonical
                 tg_client.send_message(
@@ -5031,19 +5799,69 @@ class BridgeDaemon:
                 return
 
             if cmd == "read":
+                clean_read_arg = cmd_args.strip()
+                if clean_read_arg.lower() in ("?", "list"):
+                    r_text, r_markup = self._render_read_picker(chan_snaps)
+                    tg_client.send_message(active_chat_id, r_text, reply_markup=r_markup)
+                    return
                 pinned = self.state.get_pinned_target(bot_role)
-                default_single = next(iter(chan_snaps.keys())) if len(chan_snaps) == 1 else ""
-                raw_target = cmd_args.strip() if cmd_args else (pinned or default_single)
-                target = self._resolve_in_channel(raw_target, snapshots, bot_role) or raw_target
+                effective_pinned = pinned if (pinned and (not snapshots or pinned in snapshots)) else None
+                ordered_chan = ordered_space_snapshots(chan_snaps)
+                default_single = next(iter(ordered_chan.keys())) if len(ordered_chan) == 1 else ""
+                raw_target = clean_read_arg if clean_read_arg else (effective_pinned or default_single)
+                if not raw_target:
+                    if chan_snaps:
+                        r_text, r_markup = self._render_read_picker(chan_snaps)
+                        tg_client.send_message(active_chat_id, r_text, reply_markup=r_markup)
+                    else:
+                        tg_client.send_message(active_chat_id, "Usage: <code>/read &lt;space&gt;</code>")
+                    return
+                target = (
+                    self._resolve_in_channel(
+                        raw_target,
+                        snapshots,
+                        bot_role,
+                        prefer_space_slug=from_menu_slug,
+                    )
+                    or raw_target
+                )
                 if not target or not is_valid_target(target):
-                    tg_client.send_message(active_chat_id, "Usage: <code>/read opus</code>")
+                    if chan_snaps:
+                        r_text, r_markup = self._render_read_picker(
+                            chan_snaps,
+                            prefix_html=f"❌ Unknown space <code>{html.escape(raw_target)}</code>.",
+                        )
+                        tg_client.send_message(
+                            active_chat_id,
+                            r_text,
+                            reply_markup=r_markup,
+                            reply_to_message_id=msg_id,
+                        )
+                    else:
+                        tg_client.send_message(active_chat_id, "Usage: <code>/read &lt;space&gt;</code>")
                     return
                 output = clean_terminal_output(self.herdr.read_agent(target, lines=self.read_lines))
                 read_snap = snapshots.get(target)
                 read_label = read_snap.header_label if read_snap else target
+                other_rows = (
+                    [
+                        [
+                            {
+                                "text": f"📖 {format_space_label(s, ordered_chan)}",
+                                "callback_data": f"read:{s.pane_id}",
+                            }
+                        ]
+                        for s in list(ordered_chan.values())[:6]
+                        if s.pane_id != target
+                    ]
+                    if not clean_read_arg
+                    else []
+                )
+                read_markup = {"inline_keyboard": other_rows} if other_rows else None
                 sent_id = tg_client.send_message(
                     active_chat_id,
                     f"📖 <b>{html.escape(read_label)}</b>\n<pre>{html.escape(output)}</pre>",
+                    reply_markup=read_markup,
                     reply_to_message_id=msg_id,
                 )
                 if sent_id is not None:
@@ -5053,11 +5871,56 @@ class BridgeDaemon:
 
             if cmd == "key":
                 parts = cmd_args.split()
-                if len(parts) < 2:
-                    tg_client.send_message(
-                        active_chat_id,
-                        "Usage: <code>/key opus enter</code> (or <code>esc</code>, <code>1</code>, <code>y</code>, <code>p</code>, <code>ctrl+c</code>)",
+                ordered_chan = ordered_space_snapshots(chan_snaps)
+                if not parts:
+                    if len(ordered_chan) == 1:
+                        only_snap = next(iter(ordered_chan.values()))
+                        kp_text, kp_markup = self._render_key_pad(
+                            only_snap.pane_id,
+                            only_snap,
+                            pool=ordered_chan,
+                            show_back=False,
+                        )
+                        tg_client.send_message(active_chat_id, kp_text, reply_markup=kp_markup)
+                    elif chan_snaps:
+                        ka_text, ka_markup = self._render_key_agent_picker(
+                            chan_snaps, self.state.get_pinned_target(bot_role)
+                        )
+                        tg_client.send_message(active_chat_id, ka_text, reply_markup=ka_markup)
+                    else:
+                        tg_client.send_message(
+                            active_chat_id,
+                            "Usage: <code>/key &lt;space&gt; enter</code> (or <code>esc</code>, <code>1</code>, <code>y</code>, <code>p</code>, <code>ctrl+c</code>)",
+                        )
+                    return
+                if len(parts) == 1:
+                    only_raw = parts[0]
+                    resolved_t = self._resolve_in_channel(only_raw, snapshots, bot_role) or only_raw
+                    if not is_valid_target(resolved_t) or (snapshots and resolved_t not in snapshots):
+                        err_msg = f"❌ Unknown or inactive space <code>{html.escape(only_raw)}</code>."
+                        if chan_snaps:
+                            ka_text, ka_markup = self._render_key_agent_picker(
+                                chan_snaps,
+                                self.state.get_pinned_target(bot_role),
+                                prefix_html=err_msg,
+                            )
+                            tg_client.send_message(
+                                active_chat_id,
+                                ka_text,
+                                reply_markup=ka_markup,
+                                reply_to_message_id=msg_id,
+                            )
+                        else:
+                            tg_client.send_message(active_chat_id, err_msg, reply_to_message_id=msg_id)
+                        return
+                    kp_snap = snapshots.get(resolved_t)
+                    kp_text, kp_markup = self._render_key_pad(
+                        resolved_t,
+                        kp_snap,
+                        pool=ordered_chan,
+                        show_back=len(ordered_chan) > 1,
                     )
+                    tg_client.send_message(active_chat_id, kp_text, reply_markup=kp_markup)
                     return
                 raw_target, keys = parts[0], parts[1:]
                 target = self._resolve_in_channel(raw_target, snapshots, bot_role) or raw_target
@@ -5098,7 +5961,7 @@ class BridgeDaemon:
             tg_client.send_message(
                 active_chat_id,
                 "Which agent should receive this? Swipe-reply to an agent alert, prefix with "
-                "<code>model: your message</code> (e.g. <code>opus:</code>), or set <code>/target &lt;model&gt;</code>.",
+                "<code>space: your message</code> (e.g. <code>upgrade:</code>), or set <code>/target</code>.",
                 reply_to_message_id=msg_id,
             )
             return
@@ -5109,7 +5972,7 @@ class BridgeDaemon:
         self,
         snap: AgentSnapshot,
         term_id: str,
-        msg_id: int,
+        msg_id: int | None,
         has_unsent_prompt: bool,
         prompt_error: str = "",
         bot_role: str = "default",
@@ -5192,12 +6055,36 @@ class BridgeDaemon:
     def _handle_spawn(
         self,
         arg_str: str,
-        msg_id: int,
+        msg_id: int | None,
         snapshots: dict[str, AgentSnapshot],
         bot_role: str = "default",
         image_candidates: Sequence[InboundImageCandidate] = (),
     ) -> None:
         tg_client, active_chat_id = self._channel_context(bot_role)
+        if not image_candidates:
+            try:
+                picker_agent = extract_spawn_picker_agent(
+                    arg_str,
+                    default_agent=self.default_agent,
+                    allowed_agents=self.agent_registry.allowed_names,
+                )
+            except ValueError as exc:
+                tg_client.send_message(
+                    active_chat_id,
+                    f"❌ {html.escape(str(exc))}\n{SPAWN_USAGE}",
+                    reply_to_message_id=msg_id,
+                )
+                return
+            if picker_agent is not None:
+                sp_text, sp_markup = self._render_spawn_picker(picker_agent)
+                tg_client.send_message(
+                    active_chat_id,
+                    sp_text,
+                    reply_markup=sp_markup,
+                    reply_to_message_id=msg_id,
+                )
+                return
+
         try:
             agent_alias, repo_spec, prompt = parse_spawn_args(
                 arg_str,
@@ -5344,6 +6231,7 @@ class BridgeDaemon:
         snapshots.update(enriched_map)
         snap = snapshots[created.pane_id]
         term_id = snap.terminal_id or term_id
+        self._sync_dynamic_bot_commands(snapshots)
 
         had_media = bool(saved_paths)
         if start_res.outcome != "ready":
@@ -5581,7 +6469,236 @@ class BridgeDaemon:
             tg_client.answer_callback_query(cq_id, "Unauthorized")
             return
 
+        cb_msg = cq.get("message") if isinstance(cq.get("message"), dict) else {}
+        raw_cb_msg_id = cb_msg.get("message_id")
+        cb_msg_id = int(raw_cb_msg_id) if isinstance(raw_cb_msg_id, int) else None
+
         data = str(cq.get("data") or "")
+        if data.startswith("vsend:"):
+            rest_v = data[len("vsend:") :]
+            try:
+                vtok, target_part = rest_v.split(":", 1)
+            except ValueError:
+                tg_client.answer_callback_query(cq_id, "Invalid button payload")
+                return
+            self._prune_pending_voice_notes()
+            note = self.pending_voice_notes.get(vtok)
+            if note is None or note.bot_role != bot_role:
+                tg_client.answer_callback_query(cq_id, "Voice note expired or already sent")
+                return
+            if target_part == "cancel":
+                self.pending_voice_notes.pop(vtok, None)
+                tg_client.answer_callback_query(cq_id, "Cancelled")
+                self._edit_or_send(bot_role, cb_msg_id, "🗑️ Cancelled voice note.")
+                return
+            if not is_valid_target(target_part):
+                tg_client.answer_callback_query(cq_id, "Invalid target")
+                return
+            if target_part not in snapshots:
+                with contextlib.suppress(Exception):
+                    live_map = self._enrich_snapshots(self.herdr.list_agents())
+                    snapshots.clear()
+                    snapshots.update(live_map)
+            if snapshots and target_part not in snapshots:
+                tg_client.answer_callback_query(cq_id, "Space is no longer active")
+                chan_snaps = self._channel_snapshots(snapshots, bot_role)
+                if chan_snaps:
+                    vp_text, vp_markup = self._render_voice_picker(vtok, note.transcript, chan_snaps)
+                    self._edit_or_send(bot_role, cb_msg_id, vp_text, reply_markup=vp_markup)
+                return
+            self.pending_voice_notes.pop(vtok, None)
+            ordered_chan = ordered_space_snapshots(self._channel_snapshots(snapshots, bot_role))
+            v_snap = snapshots.get(target_part)
+            v_space = format_space_label(v_snap, ordered_chan) if v_snap else target_part
+            tg_client.answer_callback_query(cq_id, f"Sending to {v_space}…")
+            if cb_msg_id is not None:
+                edit_fn = getattr(tg_client, "edit_message_text", None)
+                if callable(edit_fn):
+                    with contextlib.suppress(Exception):
+                        edit_fn(active_chat_id, cb_msg_id, f"🎙️ Routed voice note to <b>{html.escape(v_space)}</b>.")
+            self._send_prompt_to_target(
+                target_part,
+                note.transcript,
+                note.msg_id,
+                snapshots,
+                bot_role=bot_role,
+                ack_emoji="🎙️",
+                transcript_preview=note.transcript,
+            )
+            return
+
+        if data.startswith("pin:"):
+            pin_arg = data.split(":", 1)[1].strip()
+            if pin_arg == "clear":
+                self.state.set_pinned_target(None, bot_role=bot_role)
+                self.state.save(self.state_path)
+                self._sync_dynamic_bot_commands(snapshots)
+                tg_client.answer_callback_query(cq_id, "Cleared pinned target")
+                p_text, p_markup = self._render_target_picker(snapshots, bot_role)
+                self._edit_or_send(bot_role, cb_msg_id, p_text, reply_markup=p_markup)
+                return
+            if not is_valid_target(pin_arg):
+                tg_client.answer_callback_query(cq_id, "Invalid target")
+                return
+            if pin_arg not in snapshots:
+                with contextlib.suppress(Exception):
+                    live_map = self._enrich_snapshots(self.herdr.list_agents())
+                    snapshots.clear()
+                    snapshots.update(live_map)
+            if snapshots and pin_arg not in snapshots:
+                tg_client.answer_callback_query(cq_id, "Agent is no longer active")
+                p_text, p_markup = self._render_target_picker(snapshots, bot_role)
+                self._edit_or_send(bot_role, cb_msg_id, p_text, reply_markup=p_markup)
+                return
+            self.state.set_pinned_target(pin_arg, bot_role=bot_role)
+            self.state.save(self.state_path)
+            self._sync_dynamic_bot_commands(snapshots)
+            chan_ordered = ordered_space_snapshots(self._channel_snapshots(snapshots, bot_role))
+            pin_snap = snapshots.get(pin_arg)
+            pin_label = format_space_label(pin_snap, chan_ordered) if pin_snap else pin_arg
+            tg_client.answer_callback_query(cq_id, f"Pinned {pin_label}")
+            p_text, p_markup = self._render_target_picker(snapshots, bot_role)
+            self._edit_or_send(bot_role, cb_msg_id, p_text, reply_markup=p_markup)
+            return
+
+        if data.startswith("kpick:"):
+            pick_arg = data.split(":", 1)[1].strip()
+            chan_snaps = self._channel_snapshots(snapshots, bot_role)
+            if pick_arg == "__list__":
+                tg_client.answer_callback_query(cq_id, "Choose a space")
+                ka_text, ka_markup = self._render_key_agent_picker(chan_snaps, self.state.get_pinned_target(bot_role))
+                self._edit_or_send(bot_role, cb_msg_id, ka_text, reply_markup=ka_markup)
+                return
+            if not is_valid_target(pick_arg):
+                tg_client.answer_callback_query(cq_id, "Invalid target")
+                return
+            if pick_arg not in snapshots:
+                with contextlib.suppress(Exception):
+                    live_map = self._enrich_snapshots(self.herdr.list_agents())
+                    snapshots.clear()
+                    snapshots.update(live_map)
+                    chan_snaps = self._channel_snapshots(snapshots, bot_role)
+            if snapshots and pick_arg not in snapshots:
+                tg_client.answer_callback_query(cq_id, "Agent is no longer active")
+                ka_text, ka_markup = self._render_key_agent_picker(chan_snaps, self.state.get_pinned_target(bot_role))
+                self._edit_or_send(bot_role, cb_msg_id, ka_text, reply_markup=ka_markup)
+                return
+            ordered_chan = ordered_space_snapshots(chan_snaps)
+            kp_snap = snapshots.get(pick_arg)
+            kp_space = format_space_label(kp_snap, ordered_chan) if kp_snap else pick_arg
+            tg_client.answer_callback_query(cq_id, f"Keys for {kp_space}")
+            kp_text, kp_markup = self._render_key_pad(
+                pick_arg,
+                kp_snap,
+                pool=ordered_chan,
+                show_back=len(ordered_chan) > 1,
+            )
+            self._edit_or_send(bot_role, cb_msg_id, kp_text, reply_markup=kp_markup)
+            return
+
+        if data.startswith("kraw:"):
+            rest_k = data[len("kraw:") :]
+            try:
+                target, raw_key = rest_k.rsplit(":", 1)
+            except ValueError:
+                tg_client.answer_callback_query(cq_id, "Invalid button payload")
+                return
+            if not is_valid_target(target) or raw_key not in ALLOWED_KEYS:
+                tg_client.answer_callback_query(cq_id, "Invalid button payload")
+                return
+            if target not in snapshots:
+                with contextlib.suppress(Exception):
+                    live_map = self._enrich_snapshots(self.herdr.list_agents())
+                    snapshots.clear()
+                    snapshots.update(live_map)
+            if snapshots and target not in snapshots:
+                tg_client.answer_callback_query(cq_id, "Agent is no longer active")
+                return
+            ordered_chan = ordered_space_snapshots(self._channel_snapshots(snapshots, bot_role))
+            raw_snap = snapshots.get(target)
+            raw_label = raw_snap.header_label if raw_snap else target
+            raw_space = format_space_label(raw_snap, ordered_chan) if raw_snap else target
+            status, err = self._send_keys_with_status(target, [raw_key])
+            if status == "sent":
+                self._arm_fast_track_done(raw_snap.pane_id if raw_snap else target, raw_snap)
+                tg_client.answer_callback_query(cq_id, f"Sent {raw_key} to {raw_space}")
+                sent_id = tg_client.send_message(
+                    active_chat_id,
+                    f"⌨️ Sent <code>{html.escape(raw_key)}</code> to <b>{html.escape(raw_label)}</b>.",
+                )
+                if sent_id is not None:
+                    self.state.record_message(sent_id, raw_snap.pane_id if raw_snap else target, bot_role=bot_role)
+                    self.state.save(self.state_path)
+            elif status == "ambiguous":
+                self._arm_fast_track_done(raw_snap.pane_id if raw_snap else target, raw_snap)
+                tg_client.answer_callback_query(cq_id, "Timed out; check Read output")
+                tg_client.send_message(
+                    active_chat_id,
+                    f"⚠️ Timed out sending <code>{html.escape(raw_key)}</code> to <b>{html.escape(raw_label)}</b>; "
+                    f"check <b>Read output</b> before retrying.",
+                )
+            else:
+                tg_client.answer_callback_query(cq_id, "Failed")
+                tg_client.send_message(
+                    active_chat_id,
+                    f"❌ Failed sending key to <b>{html.escape(raw_label)}</b>: {html.escape(err)}",
+                )
+            return
+
+        if data.startswith("spag:"):
+            agent_cand = data.split(":", 1)[1].strip().lower()
+            if not self.agent_registry.is_supported(agent_cand):
+                tg_client.answer_callback_query(cq_id, "Unsupported agent")
+                return
+            tg_client.answer_callback_query(cq_id, f"Agent: {agent_cand}")
+            sp_text, sp_markup = self._render_spawn_picker(agent_cand)
+            self._edit_or_send(bot_role, cb_msg_id, sp_text, reply_markup=sp_markup)
+            return
+
+        if data.startswith("sprp:"):
+            rest_sp = data[len("sprp:") :]
+            try:
+                agent_cand, repo_tok = rest_sp.rsplit(":", 1)
+            except ValueError:
+                tg_client.answer_callback_query(cq_id, "Invalid button payload")
+                return
+            agent_cand = agent_cand.strip().lower()
+            if not self.agent_registry.is_supported(agent_cand) or not re.fullmatch(r"[0-9a-f]{8}", repo_tok):
+                tg_client.answer_callback_query(cq_id, "Invalid button payload")
+                return
+            matched_choice = next(
+                (c for c in discover_spawn_repos(self.spawn_roots, max_repos=64) if c.token == repo_tok),
+                None,
+            )
+            if matched_choice is None:
+                tg_client.answer_callback_query(cq_id, "Repository not found")
+                return
+            if cb_msg_id is not None:
+                picker_key = (bot_role, cb_msg_id)
+                if picker_key in self.consumed_spawn_pickers:
+                    tg_client.answer_callback_query(cq_id, "Spawn already started")
+                    return
+                if len(self.consumed_spawn_pickers) >= 128:
+                    self.consumed_spawn_pickers.clear()
+                self.consumed_spawn_pickers.add(picker_key)
+                edit_fn = getattr(tg_client, "edit_message_text", None)
+                if callable(edit_fn):
+                    with contextlib.suppress(Exception):
+                        edit_fn(
+                            active_chat_id,
+                            cb_msg_id,
+                            f"⏳ Spawning <code>{html.escape(agent_cand)}</code> in "
+                            f"<b>{html.escape(matched_choice.display_label)}</b>...",
+                        )
+            tg_client.answer_callback_query(cq_id, f"Spawning {matched_choice.display_label}…")
+            self._handle_spawn(
+                f"--agent {agent_cand} {matched_choice.repo_spec}",
+                cb_msg_id,
+                snapshots,
+                bot_role=bot_role,
+            )
+            return
+
         if data.startswith("read:"):
             target = data.split(":", 1)[1]
             read_snap = snapshots.get(target)
@@ -5796,6 +6913,222 @@ class BridgeDaemon:
             logger.exception("Unexpected error polling Telegram updates (%s bot): %s", bot_role, exc)
             return None
 
+    def _edit_or_send(
+        self,
+        bot_role: str,
+        message_id: int | None,
+        text: str,
+        reply_markup: dict[str, Any] | None = None,
+    ) -> int | None:
+        tg_client, active_chat_id = self._channel_context(bot_role)
+        if message_id is not None:
+            edit_fn = getattr(tg_client, "edit_message_text", None)
+            if callable(edit_fn):
+                with contextlib.suppress(Exception):
+                    if edit_fn(active_chat_id, message_id, text, reply_markup=reply_markup):
+                        return message_id
+        return tg_client.send_message(active_chat_id, text, reply_markup=reply_markup)
+
+    def _render_target_picker(
+        self,
+        snapshots: dict[str, AgentSnapshot],
+        bot_role: str,
+        *,
+        prefix_html: str = "",
+    ) -> tuple[str, dict[str, Any] | None]:
+        chan_snaps = self._channel_snapshots(snapshots, bot_role)
+        display_pool = ordered_space_snapshots(chan_snaps)
+        pinned = self.state.get_pinned_target(bot_role)
+        all_ordered = ordered_space_snapshots(snapshots)
+        pinned_snap = snapshots.get(pinned) if pinned else None
+        pinned_display = (
+            f"<b>{html.escape(format_space_label(pinned_snap, all_ordered))}</b>"
+            if pinned_snap
+            else f"<code>{html.escape(pinned or 'none')}</code>"
+        )
+        lines: list[str] = []
+        if prefix_html:
+            lines.append(prefix_html)
+        lines.append(f"🎯 <b>Pinned space:</b> {pinned_display}")
+        keyboard_rows: list[list[dict[str, str]]] = []
+        if display_pool:
+            lines.append("Tap a space or review agent below to pin it as your default reply target:")
+            for snap in list(display_pool.values())[:24]:
+                is_pinned = snap.pane_id == pinned
+                btn_prefix = "🎯 " if is_pinned else "📌 "
+                btn_suffix = " ✓" if is_pinned else ""
+                btn_label = format_space_label(snap, display_pool)
+                keyboard_rows.append(
+                    [
+                        {
+                            "text": f"{btn_prefix}{btn_label}{btn_suffix}",
+                            "callback_data": f"pin:{snap.pane_id}",
+                        }
+                    ]
+                )
+        else:
+            lines.append("No active spaces in this channel right now. Use <code>/spawn</code> to start one.")
+        if pinned:
+            keyboard_rows.append([{"text": "🧹 Clear pin", "callback_data": "pin:clear"}])
+        markup = {"inline_keyboard": keyboard_rows} if keyboard_rows else None
+        return "\n".join(lines), markup
+
+    def _render_read_picker(
+        self,
+        chan_snaps: dict[str, AgentSnapshot],
+        *,
+        prefix_html: str = "",
+    ) -> tuple[str, dict[str, Any] | None]:
+        lines: list[str] = []
+        if prefix_html:
+            lines.append(prefix_html)
+        display_pool = ordered_space_snapshots(chan_snaps)
+        if not display_pool:
+            lines.append("No active spaces to read right now. Use <code>/spawn</code> to start one.")
+            return "\n".join(lines), None
+        lines.append("📖 <b>Select a space to read:</b>")
+        rows = [
+            [
+                {
+                    "text": f"📖 {format_space_label(snap, display_pool)}",
+                    "callback_data": f"read:{snap.pane_id}",
+                }
+            ]
+            for snap in list(display_pool.values())[:24]
+        ]
+        return "\n".join(lines), {"inline_keyboard": rows}
+
+    def _render_key_agent_picker(
+        self,
+        chan_snaps: dict[str, AgentSnapshot],
+        pinned: str | None,
+        *,
+        prefix_html: str = "",
+    ) -> tuple[str, dict[str, Any] | None]:
+        lines: list[str] = []
+        if prefix_html:
+            lines.append(prefix_html)
+        display_pool = ordered_space_snapshots(chan_snaps)
+        if not display_pool:
+            lines.append(
+                "Usage: <code>/key &lt;space&gt; enter</code> (or <code>esc</code>, <code>1</code>, <code>y</code>, <code>p</code>, <code>ctrl+c</code>)"
+            )
+            return "\n".join(lines), None
+        lines.append("⌨️ <b>Select a space to send keys:</b>")
+        rows = [
+            [
+                {
+                    "text": f"{'🎯 ' if snap.pane_id == pinned else '⌨️ '}{format_space_label(snap, display_pool)}",
+                    "callback_data": f"kpick:{snap.pane_id}",
+                }
+            ]
+            for snap in list(display_pool.values())[:24]
+        ]
+        return "\n".join(lines), {"inline_keyboard": rows}
+
+    def _render_key_pad(
+        self,
+        target: str,
+        snap: AgentSnapshot | None,
+        *,
+        pool: Mapping[str, AgentSnapshot] | None = None,
+        show_back: bool = False,
+    ) -> tuple[str, dict[str, Any]]:
+        label = format_space_label(snap, pool) if snap else target
+        slug_map = assign_space_command_slugs(pool) if pool else {}
+        space_hint = slug_map.get(snap.pane_id, snap.friendly_handle) if snap else target
+        text = (
+            f"⌨️ <b>Send key to {html.escape(label)}</b>\n"
+            f"Tap a key below, or type <code>/key {html.escape(space_hint)} &lt;key&gt;</code>:"
+        )
+        rows: list[list[dict[str, str]]] = [
+            [
+                {"text": "⏎ Enter", "callback_data": f"kraw:{target}:enter"},
+                {"text": "⎋ Esc", "callback_data": f"kraw:{target}:esc"},
+                {"text": "⇥ Tab", "callback_data": f"kraw:{target}:tab"},
+                {"text": "␣ Space", "callback_data": f"kraw:{target}:space"},
+            ],
+            [
+                {"text": "👍 y", "callback_data": f"kraw:{target}:y"},
+                {"text": "👎 n", "callback_data": f"kraw:{target}:n"},
+                {"text": "1️⃣ 1", "callback_data": f"kraw:{target}:1"},
+                {"text": "2️⃣ 2", "callback_data": f"kraw:{target}:2"},
+                {"text": "3️⃣ 3", "callback_data": f"kraw:{target}:3"},
+                {"text": "4️⃣ 4", "callback_data": f"kraw:{target}:4"},
+            ],
+            [
+                {"text": "⬆️", "callback_data": f"kraw:{target}:up"},
+                {"text": "⬇️", "callback_data": f"kraw:{target}:down"},
+                {"text": "🛑 Ctrl+C", "callback_data": f"kraw:{target}:ctrl+c"},
+                {"text": "📖 Read", "callback_data": f"read:{target}"},
+            ],
+        ]
+        if show_back:
+            rows.append([{"text": "⬅️ Switch space", "callback_data": "kpick:__list__"}])
+        return text, {"inline_keyboard": rows}
+
+    def _render_spawn_picker(self, selected_agent: str) -> tuple[str, dict[str, Any] | None]:
+        choices = discover_spawn_repos(self.spawn_roots)
+        if not choices:
+            return f"No repositories found under configured spawn roots.\n{SPAWN_USAGE}", None
+        agents = list(self.agent_registry.allowed_names)[:8]
+        agent_btns = [{"text": f"🤖 {a} ✓" if a == selected_agent else a, "callback_data": f"spag:{a}"} for a in agents]
+        rows: list[list[dict[str, str]]] = [agent_btns[i : i + 4] for i in range(0, len(agent_btns), 4)]
+        cur_row: list[dict[str, str]] = []
+        for ch in choices:
+            icon = "📁" if ch.is_git else "📂"
+            btn = {"text": f"{icon} {ch.display_label}", "callback_data": f"sprp:{selected_agent}:{ch.token}"}
+            if len(ch.display_label) > 22:
+                if cur_row:
+                    rows.append(cur_row)
+                    cur_row = []
+                rows.append([btn])
+            else:
+                cur_row.append(btn)
+                if len(cur_row) == 2:
+                    rows.append(cur_row)
+                    cur_row = []
+        if cur_row:
+            rows.append(cur_row)
+        text = (
+            f"🚀 <b>Spawn Workspace</b> · agent: <code>{html.escape(selected_agent)}</code>\n"
+            f"Tap a repository below to launch, or type <code>/spawn [--agent &lt;agent&gt;] &lt;repo&gt; [prompt]</code>:"
+        )
+        return text, {"inline_keyboard": rows}
+
+    def _sync_dynamic_bot_commands(self, snapshots: dict[str, AgentSnapshot]) -> None:
+        """Update per-chat '/' menus with live '/target_<handle>' and '/read_<handle>' commands when roster changes."""
+        enriched = (
+            snapshots
+            if (not snapshots or all(s.model_handle for s in snapshots.values()))
+            else self._enrich_snapshots(snapshots)
+        )
+        for bot_role, (tg_client, chat_id, _) in self.bot_channels.items():
+            if not chat_id:
+                continue
+            set_fn = getattr(tg_client, "set_my_commands", None)
+            if not callable(set_fn):
+                continue
+            chan_snaps = self._channel_snapshots(enriched, bot_role)
+            pinned = self.state.get_pinned_target(bot_role)
+            cmds = build_dynamic_bot_commands(chan_snaps, pinned)
+            if self._synced_chat_commands.get(bot_role) == cmds:
+                continue
+            scope_cid: int | str = int(chat_id) if chat_id.lstrip("-").isdigit() else chat_id
+            scope = {"type": "chat", "chat_id": scope_cid}
+            try:
+                try:
+                    set_fn(cmds, scope=scope)
+                except TypeError:
+                    set_fn(cmds)
+                self._synced_chat_commands[bot_role] = cmds
+            except Exception as exc:
+                logger.debug(
+                    "Could not sync dynamic chat commands for %s bot: %s",
+                    bot_role,
+                    redact_secrets(str(exc)),
+                )
+
     def _sync_bot_commands(self) -> None:
         """Register Telegram's native '/' command picker across configured bot channels."""
         for bot_role, (tg_client, _, _) in self.bot_channels.items():
@@ -5810,13 +7143,14 @@ class BridgeDaemon:
     def run_forever(self) -> None:
         bot_names = list(self.bot_channels.keys())
         logger.info(
-            "Starting Herdr Telegram bridge (chat_id=%s, bots=%s, routes=%s, idle_delay=%ss, blocked_delay=%ss, summary=%s)",
+            "Starting Herdr Telegram bridge (chat_id=%s, bots=%s, routes=%s, idle_delay=%ss, blocked_delay=%ss, summary=%s, voice=%s)",
             self.chat_id or "<pairing-mode>",
             ",".join(bot_names),
             len(self.rule_engine.routes),
             self.rule_engine.defaults.idle_delay_seconds,
             self.rule_engine.defaults.blocked_delay_seconds,
             self.summarizer.summary_label,
+            self.transcriber.voice_label,
         )
         self._sync_bot_commands()
         try:
@@ -5866,9 +7200,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         "setup",
         help="Interactive first-run wizard: verify @BotFather token, auto-pair via /start, and start service",
     )
+    voice_parser = subparsers.add_parser(
+        "setup-voice",
+        help="Install free local offline faster-whisper transcription in ~/.local/state/herdr-telegram/voice-venv",
+    )
+    voice_parser.add_argument(
+        "--model",
+        default=DEFAULT_LOCAL_VOICE_MODEL,
+        help=f"Whisper CTranslate2 model to cache locally (default: {DEFAULT_LOCAL_VOICE_MODEL})",
+    )
     doctor_parser = subparsers.add_parser(
         "doctor",
-        help="Check config, permissions, Herdr connectivity, Telegram bots, summarizer, and service state",
+        help="Check config, permissions, Herdr connectivity, Telegram bots, summarizer, voice, and service state",
     )
     doctor_parser.add_argument("--json", action="store_true", help="Output machine-readable JSON")
     doctor_parser.add_argument("--offline", action="store_true", help="Skip live Telegram getMe API checks")
@@ -5876,6 +7219,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     parsed = parser.parse_args(list(argv) if argv is not None else None)
     if parsed.command == "setup":
         return run_setup()
+    if parsed.command == "setup-voice":
+        return run_setup_voice(model=parsed.model)
     if parsed.command == "doctor":
         return run_doctor(as_json=parsed.json, offline=parsed.offline)
 
@@ -5924,12 +7269,25 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
             return _fatal_config_exit()
 
+    if cfg.voice_provider.lower() not in SUPPORTED_VOICE_PROVIDERS:
+        logger.error(
+            "Invalid voice_provider=%r (expected auto, off, local, faster-whisper, openai, groq, or gemini-api)",
+            cfg.voice_provider,
+        )
+        return _fatal_config_exit()
+
     summarizer = TurnSummarizer(
         model=defs.summary_model,
         min_chars=cfg.summary_min_chars,
         provider=defs.summary_provider,
         api_key=cfg.summary_api_key,
         api_url=cfg.summary_api_url,
+    )
+    transcriber = VoiceTranscriber(
+        provider=cfg.voice_provider,
+        model=cfg.voice_model,
+        api_key=cfg.voice_api_key,
+        api_url=cfg.voice_api_url,
     )
 
     lock_fd = os.open(state_dir / "bridge.lock", os.O_WRONLY | os.O_CREAT, 0o600)
@@ -5969,6 +7327,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         agent_registry=cfg.agent_registry,
         summary_api_key=cfg.summary_api_key,
         summary_api_url=cfg.summary_api_url,
+        transcriber=transcriber,
     )
     daemon.run_forever()
     return 0

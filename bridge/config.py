@@ -187,6 +187,10 @@ class BridgeConfig:
     spawn_timeout_ms: int
     summary_api_key: str = ""
     summary_api_url: str = ""
+    voice_provider: str = "auto"
+    voice_model: str = ""
+    voice_api_key: str = ""
+    voice_api_url: str = ""
 
 
 def _default_spawn_roots_from_env(raw: str) -> tuple[Path, ...]:
@@ -436,6 +440,19 @@ def load_bridge_config(
                 )
             )
 
+    voice_provider = (
+        str(
+            merged_env.get("HERDR_VOICE_PROVIDER")
+            or defaults_tbl.get("voice_provider")
+            or bridge_tbl.get("voice_provider")
+            or "auto"
+        ).strip()
+        or "auto"
+    )
+    voice_model = str(
+        merged_env.get("HERDR_VOICE_MODEL") or defaults_tbl.get("voice_model") or bridge_tbl.get("voice_model") or ""
+    ).strip()
+
     return BridgeConfig(
         bots=bots,
         rule_engine=RuleEngine(defaults=route_defaults, routes=routes),
@@ -449,4 +466,8 @@ def load_bridge_config(
         spawn_timeout_ms=spawn_timeout_ms,
         summary_api_key=merged_env.get("HERDR_SUMMARY_API_KEY", "").strip(),
         summary_api_url=merged_env.get("HERDR_SUMMARY_API_URL", "").strip(),
+        voice_provider=voice_provider,
+        voice_model=voice_model,
+        voice_api_key=merged_env.get("HERDR_VOICE_API_KEY", "").strip(),
+        voice_api_url=merged_env.get("HERDR_VOICE_API_URL", "").strip(),
     )

@@ -427,6 +427,42 @@ def run_doctor(
                 label = f"{prov}:{mod}" if mod else prov
                 checks.append(DoctorCheck("summarizer", "ok", f"{label} ({via})"))
 
+        # 6b. Voice transcription backend
+        if cfg.voice_provider.lower() not in ht.SUPPORTED_VOICE_PROVIDERS:
+            checks.append(DoctorCheck("voice", "error", f"Unsupported voice_provider={cfg.voice_provider!r}"))
+        else:
+            v_prov, v_mod, v_py, v_url, _ = ht.resolve_voice_backend(
+                provider=cfg.voice_provider,
+                model=cfg.voice_model,
+                api_key=cfg.voice_api_key,
+                api_url=cfg.voice_api_url,
+                env=effective_env,
+            )
+            if v_prov == "off":
+                checks.append(DoctorCheck("voice", "ok", "off (voice note transcription disabled)"))
+            elif v_prov == "unconfigured":
+                is_auto_voice = cfg.voice_provider.strip().lower() == "auto" and not cfg.voice_model.strip()
+                if is_auto_voice:
+                    checks.append(
+                        DoctorCheck(
+                            "voice",
+                            "ok",
+                            "optional (not enabled; run 'herdr-telegram setup-voice' or set voice_provider = 'off')",
+                        )
+                    )
+                else:
+                    checks.append(
+                        DoctorCheck(
+                            "voice",
+                            "warn",
+                            f"{cfg.voice_provider} requested but not configured (run 'herdr-telegram setup-voice' or set HERDR_VOICE_API_KEY)",
+                        )
+                    )
+            else:
+                v_via = v_py or ht._redact_url_for_log(v_url)
+                v_label = f"{v_prov}:{v_mod}" if v_mod else v_prov
+                checks.append(DoctorCheck("voice", "ok", f"{v_label} ({v_via})"))
+
         # 7. Spawn roots
         existing_roots = [str(p) for p in cfg.spawn_roots if p.expanduser().is_dir()]
         if existing_roots:
@@ -668,4 +704,18 @@ def run_setup(
         print(f"Service ready: {svc_msg}")
     else:
         print(f"Note: {svc_msg}")
+    return 0
+
+
+def run_setup_voice(*, model: str = "large-v3-turbo") -> int:
+    """Install local faster-whisper into ~/.local/state/herdr-telegram/voice-venv and pre-cache the model."""
+    from bridge.voice import install_local_voice_venv
+
+    clean_model = model.strip() or "large-v3-turbo"
+    print(f"Setting up local faster-whisper ({clean_model}) for offline Telegram voice notes...")
+    ok, detail = install_local_voice_venv(model=clean_model)
+    if not ok:
+        print(f"Error: {detail}", file=sys.stderr)
+        return 1
+    print(detail)
     return 0
