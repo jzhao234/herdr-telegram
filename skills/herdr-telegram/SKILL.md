@@ -23,8 +23,8 @@ telegram-send "Database migration passed; ready for smoke test?"
 # Send a UI screenshot, chart, or visual diff (PNG, JPEG, WebP, or GIF)
 telegram-send --photo ./artifacts/mobile-check.png "Updated mobile layout; approve?"
 
-# Target a specific named bot channel from config.toml (such as --bot ops or --prod)
-telegram-send --bot ops "🟢 All 12 HTTP health checks passing"
+# Target a specific named bot channel from config.toml (such as --bot alerts)
+telegram-send --bot alerts "🟢 All 12 HTTP health checks passing"
 ```
 
 ### Status & Sweep Formatting

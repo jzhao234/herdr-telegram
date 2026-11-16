@@ -30,7 +30,7 @@ class SnapshotLike(Protocol):
 
 
 def normalize_match_key(value: str) -> str:
-    """Normalize labels for resilient glob matching ('Prod Support' -> 'prod-support', keeping '*' and '?')."""
+    """Normalize labels for resilient glob matching ('My Project' -> 'my-project', keeping '*' and '?')."""
     return re.sub(r"[^a-z0-9*?]+", "-", value.strip().lower()).strip("-")
 
 

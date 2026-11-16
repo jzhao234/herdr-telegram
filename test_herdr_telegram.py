@@ -2373,7 +2373,8 @@ class HerdrTelegramBridgeTest(unittest.TestCase):
                 self.assertEqual(len(herdr.prompts), prev_prompts)
                 self.assertIn("Which agent should receive this?", dev_tg.sent[-1]["text"])
 
-                # /status scopes per bot channel, while /status all shows all agents
+                # /status scopes per bot channel with generic default headings unless renamed by user,
+                # while /status all shows all agents
                 daemon.handle_update(
                     {
                         "update_id": 52,
@@ -2387,7 +2388,8 @@ class HerdrTelegramBridgeTest(unittest.TestCase):
                     snapshots,
                     bot_role="prod",
                 )
-                self.assertIn("<b>Prod Support Agents</b>", prod_tg.sent[-1]["text"])
+                self.assertIn("<b>Herdr Bridge (prod)</b>", prod_tg.sent[-1]["text"])
+                self.assertNotIn("Prod Support Agents", prod_tg.sent[-1]["text"])
                 self.assertIn("Prod Support", prod_tg.sent[-1]["text"])
                 self.assertNotIn("Migration", prod_tg.sent[-1]["text"])
 
@@ -2404,7 +2406,8 @@ class HerdrTelegramBridgeTest(unittest.TestCase):
                     snapshots,
                     bot_role="default",
                 )
-                self.assertIn("<b>Herdr Dev Agents</b>", dev_tg.sent[-1]["text"])
+                self.assertIn("<b>Herdr Telegram Bridge</b>", dev_tg.sent[-1]["text"])
+                self.assertNotIn("Herdr Dev Agents", dev_tg.sent[-1]["text"])
                 self.assertIn("Upgrade", dev_tg.sent[-1]["text"])
                 self.assertIn("Migration", dev_tg.sent[-1]["text"])
                 self.assertNotIn("Prod Support", dev_tg.sent[-1]["text"])
@@ -2432,6 +2435,30 @@ class HerdrTelegramBridgeTest(unittest.TestCase):
                 self.assertEqual(reloaded.prod_last_update_id, 50)
                 self.assertEqual(reloaded.get_message_targets("default")["101"], "w22:p1")
                 self.assertEqual(reloaded.get_message_targets("prod")["101"], "w21:p1")
+
+                # Generic env secondary bot + user-customizable titles
+                gen_env = Path(tmp) / "generic.env"
+                gen_env.write_text(
+                    "TELEGRAM_BOT_TOKEN=111:def\nTELEGRAM_CHAT_ID=777\nTELEGRAM_SECONDARY_BOT_TOKEN=222:sec\n",
+                    encoding="utf-8",
+                )
+                gen_cfg = load_bridge_config(Path(tmp) / "missing.toml", env_path=gen_env, environ={})
+                self.assertEqual(gen_cfg.bots["default"].display_title, "Herdr Telegram Bridge")
+                self.assertEqual(gen_cfg.bots["secondary"].display_title, "Herdr Bridge (secondary)")
+
+                renamed_env = Path(tmp) / "renamed.env"
+                renamed_env.write_text(
+                    "TELEGRAM_BOT_TOKEN=111:def\n"
+                    "TELEGRAM_CHAT_ID=777\n"
+                    "TELEGRAM_BOT_TITLE=Jun Coding Bot\n"
+                    "TELEGRAM_SECONDARY_BOT_TOKEN=222:sec\n"
+                    "TELEGRAM_SECONDARY_BOT_NAME=alerts\n"
+                    "TELEGRAM_SECONDARY_BOT_TITLE=Pager Bot\n",
+                    encoding="utf-8",
+                )
+                renamed_cfg = load_bridge_config(Path(tmp) / "missing.toml", env_path=renamed_env, environ={})
+                self.assertEqual(renamed_cfg.bots["default"].display_title, "Jun Coding Bot")
+                self.assertEqual(renamed_cfg.bots["alerts"].display_title, "Pager Bot")
             finally:
                 daemon.close()
 

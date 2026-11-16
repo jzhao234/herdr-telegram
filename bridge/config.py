@@ -288,26 +288,42 @@ def load_bridge_config(
     else:
         spawn_roots = _default_spawn_roots_from_env("")
 
-    # 3. Bot channels ([bots.<name>] + TELEGRAM_BOT_TOKEN / TELEGRAM_PROD_BOT_TOKEN)
+    # 3. Bot channels ([bots.<name>] in config.toml + TELEGRAM_BOT_TOKEN / optional secondary env token)
     primary_token = merged_env.get("TELEGRAM_BOT_TOKEN", "").strip()
     primary_chat_id = merged_env.get("TELEGRAM_CHAT_ID", "").strip()
+    primary_title = merged_env.get("TELEGRAM_BOT_TITLE", "").strip()
     bots: dict[str, BotChannelSpec] = {}
     if primary_token:
         bots["default"] = BotChannelSpec(
             name="default",
             token=primary_token,
             chat_id=primary_chat_id,
-            title="Herdr Telegram Bridge",
+            title=primary_title,
+        )
+
+    sec_token = merged_env.get("TELEGRAM_SECONDARY_BOT_TOKEN", "").strip()
+    sec_chat_id = merged_env.get("TELEGRAM_SECONDARY_CHAT_ID", "").strip() or primary_chat_id
+    sec_name = merged_env.get("TELEGRAM_SECONDARY_BOT_NAME", "").strip().lower() or "secondary"
+    sec_title = merged_env.get("TELEGRAM_SECONDARY_BOT_TITLE", "").strip()
+    if sec_token and sec_token != primary_token:
+        if not BOT_NAME_RE.match(sec_name) or sec_name in ("default", "main"):
+            raise ValueError(f"Invalid TELEGRAM_SECONDARY_BOT_NAME={sec_name!r}")
+        bots[sec_name] = BotChannelSpec(
+            name=sec_name,
+            token=sec_token,
+            chat_id=sec_chat_id,
+            title=sec_title,
         )
 
     prod_token = merged_env.get("TELEGRAM_PROD_BOT_TOKEN", "").strip()
     prod_chat_id = merged_env.get("TELEGRAM_PROD_CHAT_ID", "").strip() or primary_chat_id
+    prod_title = merged_env.get("TELEGRAM_PROD_BOT_TITLE", "").strip()
     if prod_token and prod_token != primary_token:
         bots["prod"] = BotChannelSpec(
             name="prod",
             token=prod_token,
             chat_id=prod_chat_id,
-            title="Herdr Prod Support Bridge",
+            title=prod_title,
         )
 
     bots_tbl = toml_data.get("bots") or {}

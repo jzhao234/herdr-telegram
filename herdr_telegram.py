@@ -4320,7 +4320,7 @@ class BridgeDaemon:
             "default": (self.telegram, self.chat_id, "Herdr Telegram Bridge"),
         }
         if self.prod_telegram is not None:
-            resolved_channels["prod"] = (self.prod_telegram, self.prod_chat_id, "Herdr Prod Support Bridge")
+            resolved_channels["prod"] = (self.prod_telegram, self.prod_chat_id, "Herdr Bridge (prod)")
         if bot_channels is not None:
             for raw_name, chan_val in bot_channels.items():
                 b_name = "default" if raw_name.strip().lower() in ("default", "main") else raw_name.strip().lower()
@@ -4329,11 +4329,7 @@ class BridgeDaemon:
                 else:
                     c_tg, c_cid = chan_val
                     c_title = ""
-                default_title = (
-                    "Herdr Telegram Bridge"
-                    if b_name == "default"
-                    else ("Herdr Prod Support Bridge" if b_name == "prod" else f"Herdr Bridge ({b_name})")
-                )
+                default_title = "Herdr Telegram Bridge" if b_name == "default" else f"Herdr Bridge ({b_name})"
                 resolved_channels[b_name] = (c_tg, c_cid.strip(), c_title.strip() or default_title)
             self.telegram, self.chat_id, _ = resolved_channels["default"]
             if "prod" in resolved_channels:
@@ -5829,23 +5825,18 @@ class BridgeDaemon:
                 show_all = cmd_args.strip().lower() == "all" or not multi_bot
                 view_snaps = snapshots if show_all else chan_snaps
                 if show_all:
-                    title = "Herdr Agents"
-                    empty_msg = "No active Herdr agents found."
-                elif bot_role == "prod":
-                    title = "Prod Support Agents"
-                    empty_msg = (
-                        "No active Prod Support agents found.\n"
-                        "Use <code>/spawn</code> to start one, or <code>/status all</code> for all agents."
+                    custom_default = self._channel_title("default") if not multi_bot else ""
+                    title = (
+                        custom_default
+                        if (custom_default and custom_default != "Herdr Telegram Bridge")
+                        else "Herdr Agents"
                     )
-                elif bot_role == "default":
-                    title = "Herdr Dev Agents"
-                    empty_msg = "No active dev agents found. Use <code>/status all</code> to see all channels."
+                    empty_msg = "No active Herdr agents found."
                 else:
-                    chan_heading = self._channel_title(bot_role)
-                    title = chan_heading
+                    title = self._channel_title(bot_role)
                     empty_msg = (
                         f"No active {html.escape(bot_role)} agents found. "
-                        f"Use <code>/status all</code> to see all channels."
+                        f"Use <code>/spawn</code> to start one, or <code>/status all</code> to see all channels."
                     )
                 ordered_view = ordered_space_snapshots(view_snaps)
                 keyboard_rows = [

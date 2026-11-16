@@ -73,7 +73,7 @@ def run_cli(
         action="store_const",
         const="prod",
         dest="bot",
-        help="Shortcut for --bot prod",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--photo",

@@ -66,13 +66,14 @@ cd herdr-telegram && ./install.sh
 
 ## Modular Rules & Pluggable Agents (`config.toml`)
 
-Out of the box, `~/.config/herdr-telegram/env` is all you need for a single-bot (or two-bot `TELEGRAM_PROD_BOT_TOKEN`) setup. When you want custom agent profiles, multiple Telegram bots, or per-workflow rules (for example an instant-delivery `ops` channel with silent all-green sweeps alongside a `90s`-debounced `[defaults]` coding channel), copy [config.example.toml](config.example.toml) to `~/.config/herdr-telegram/config.toml`:
+Out of the box, `~/.config/herdr-telegram/env` is all you need for a single-bot setup (`Herdr Telegram Bridge`). When you want multiple Telegram bots with your own channel names and titles, custom agent profiles, or per-workflow rules (for example an instant-delivery `alerts` bot with silent all-green sweeps alongside your `90s`-debounced `[defaults]` bot), copy [config.example.toml](config.example.toml) to `~/.config/herdr-telegram/config.toml`:
 
 ```toml
 # Keep tokens private in ~/.config/herdr-telegram/env; reference env var names here.
-[bots.ops]
-token_env = "TELEGRAM_OPS_BOT_TOKEN"
-title = "Herdr Ops Bridge"
+# Name channels whatever you want; title defaults to "Herdr Bridge (<name>)" unless set.
+[bots.alerts]
+token_env = "TELEGRAM_ALERTS_BOT_TOKEN"
+title = "Alerts Bot"
 
 # Fallback policy ("the rest") when no [[routes]] rule matches
 [defaults]
@@ -84,9 +85,9 @@ silent_when_green = false
 
 # First matching [[routes]] entry wins (workspace, agent, name, or title globs)
 [[routes]]
-name = "ops"
-match_workspaces = ["prod-support", "on-duty", "ops-*", "incident-*"]
-bot = "ops"
+name = "alerts"
+match_workspaces = ["alerts-*", "deploy-*", "incident-*"]
+bot = "alerts"
 idle_delay_seconds = 0
 silent_when_green = true
 summary_style = "- Keep deploy and health-sweep bullets under 20 words."
@@ -178,8 +179,8 @@ telegram-send "Finished database migration; ready for smoke test?"
 # Send a UI screenshot, chart, or diff image (swipe-replying to the photo routes back to the pane)
 telegram-send --photo ./artifacts/login-mobile.png "Updated mobile layout; approve?"
 
-# Force delivery through a specific named bot channel (such as --bot ops or --prod)
-telegram-send --bot ops "🟢 HTTP health (12/12 endpoints healthy)"
+# Force delivery through a specific named bot channel from config.toml (such as --bot alerts)
+telegram-send --bot alerts "🟢 HTTP health (12/12 endpoints healthy)"
 ```
 
 If you installed with a custom `HERDR_TELEGRAM_CONFIG_DIR`, export `HERDR_TELEGRAM_CONFIG_DIR` in your shell profile as well so `telegram-send` reads the same directory as the background service.

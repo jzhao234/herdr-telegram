@@ -115,7 +115,7 @@ First matching `[[routes]]` rule wins (`match_workspaces`, `match_agents`, `matc
 
 ### `[bots.<name>]` & `[agents.<alias>]`
 
-- **`[bots.<name>]`:** Set `token_env = "TELEGRAM_OPS_BOT_TOKEN"` (and optional `chat_id_env`, `title`) so tokens stay in `~/.config/herdr-telegram/env` while `config.toml` stays safe to commit to dotfiles.
+- **`[bots.<name>]`:** Name channels generically or to match the user's workflow (e.g. `[bots.alerts]`, `[bots.ci]`). Set `token_env = "TELEGRAM_ALERTS_BOT_TOKEN"` (and optional `chat_id_env`, `title`) so tokens stay in `~/.config/herdr-telegram/env` while `config.toml` stays safe to commit to dotfiles. When `title` is omitted, `"default"` uses `"Herdr Telegram Bridge"` and any named channel `<name>` uses `"Herdr Bridge (<name>)"`.
 - **`[agents.<alias>]`:** Define `kind` (one of the 22 built-in Herdr agent kinds in `bridge/agents.py`), `spawn_args = [...]`, `default_model = "..."`, and optional TUI regex overrides (`model_patterns`, `prompt_prefixes`, `footer_patterns`).
 
 ---

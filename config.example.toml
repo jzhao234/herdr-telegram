@@ -16,17 +16,22 @@ spawn_timeout_ms = 30000
 # spawn_roots = ["~/projects", "~/code"]
 
 # ---------------------------------------------------------------------------
-# Named Telegram bot channels (add as many bots as you want)
-# Primary bot ("default") is loaded automatically from TELEGRAM_BOT_TOKEN.
+# Named Telegram bot channels (name them whatever fits your workflow)
+# Primary bot ("default") is loaded automatically from TELEGRAM_BOT_TOKEN
+# and titled "Herdr Telegram Bridge" unless overridden via [bots.default] title.
+# Additional bots default to "Herdr Bridge (<name>)" unless you set `title`.
 # ---------------------------------------------------------------------------
-[bots.ops]
-token_env = "TELEGRAM_OPS_BOT_TOKEN"
-# chat_id_env = "TELEGRAM_OPS_CHAT_ID" # optional; defaults to TELEGRAM_CHAT_ID
-title = "Herdr Ops Bridge"
+# [bots.default]
+# title = "My Coding Agents"
+
+[bots.alerts]
+token_env = "TELEGRAM_ALERTS_BOT_TOKEN"
+# chat_id_env = "TELEGRAM_ALERTS_CHAT_ID" # optional; defaults to TELEGRAM_CHAT_ID
+# title = "Alerts Bot"                    # optional; defaults to "Herdr Bridge (alerts)"
 
 # [bots.nightly]
 # token_env = "TELEGRAM_NIGHTLY_BOT_TOKEN"
-# title = "Herdr Nightly CI Bridge"
+# title = "Nightly CI"
 
 # ---------------------------------------------------------------------------
 # Fallback rules ("the rest") applied when no [[routes]] rule matches
@@ -52,9 +57,9 @@ voice_model = ""        # e.g. "large-v3-turbo", "small.en", "gpt-4o-mini-transc
 # Supports case-insensitive globs on workspace label, agent kind/alias, name, or title.
 # ---------------------------------------------------------------------------
 [[routes]]
-name = "ops"
-match_workspaces = ["prod-support", "production-support", "on-duty", "ops-*", "incident-*"]
-bot = "ops"
+name = "alerts"
+match_workspaces = ["alerts-*", "deploy-*", "incident-*"]
+bot = "alerts"
 idle_delay_seconds = 0
 silent_when_green = true
 hold_on_short_timers = true
