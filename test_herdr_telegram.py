@@ -4589,7 +4589,7 @@ class HerdrTelegramBridgeTest(unittest.TestCase):
             with patch("sys.stdout", new_callable=io.StringIO) as out_buf, self.assertRaises(SystemExit) as sys_ctx:
                 cli_fn(["--version"])
             self.assertEqual(sys_ctx.exception.code, 0)
-            self.assertIn("0.2.0", out_buf.getvalue())
+            self.assertIn(ht.__version__, out_buf.getvalue())
 
         # 2. TelegramClient._post scrubs bot token from HTTPError.url / .filename and extracts description
         secret_tok = "123456789:AAH_post_secret_token_value_999"

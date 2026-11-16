@@ -22,7 +22,7 @@ from urllib.parse import urlparse
 try:
     from bridge import __version__
 except ImportError:
-    __version__ = "0.2.0"
+    __version__ = "0.3.0"
 
 
 def _resolve_default_tailscale_bin() -> str:

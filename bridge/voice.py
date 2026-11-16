@@ -577,7 +577,7 @@ class VoiceTranscriber:
 
         headers = {
             "Content-Type": f"multipart/form-data; boundary={boundary}",
-            "User-Agent": "herdr-telegram/0.2",
+            "User-Agent": "herdr-telegram/0.3",
         }
         if self._api_key:
             headers["Authorization"] = f"Bearer {self._api_key}"
@@ -634,7 +634,7 @@ class VoiceTranscriber:
             headers={
                 "Content-Type": "application/json",
                 "x-goog-api-key": self._api_key,
-                "User-Agent": "herdr-telegram/0.2",
+                "User-Agent": "herdr-telegram/0.3",
             },
             method="POST",
         )

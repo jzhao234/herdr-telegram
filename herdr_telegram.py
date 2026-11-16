@@ -2735,7 +2735,7 @@ class TurnSummarizer:
         base = self.api_url.rstrip("/")
         headers: dict[str, str] = {
             "Content-Type": "application/json",
-            "User-Agent": "herdr-telegram/0.2",
+            "User-Agent": "herdr-telegram/0.3",
         }
         if self.provider in ("openai", "ollama"):
             endpoint = base if base.endswith("/chat/completions") else f"{base}/chat/completions"

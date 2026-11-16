@@ -4,13 +4,13 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "herdr-telegram"
-version = "0.2.0"
+version = "0.3.0"
 description = "Modular two-way Telegram bridge and Tailscale mobile preview helpers for Herdr terminal agents"
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.11"
 authors = [{ name = "Junhao Zhao" }]
-keywords = ["herdr", "telegram", "claude-code", "codex", "gemini", "opencode", "tailscale", "terminal", "agents"]
+keywords = ["herdr", "telegram", "claude-code", "codex", "gemini", "opencode", "tailscale", "terminal", "agents", "whisper"]
 dependencies = []
 
 [project.optional-dependencies]

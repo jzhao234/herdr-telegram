@@ -18,7 +18,11 @@ Runs as a lightweight user daemon (`systemd --user` on Linux, `launchd` on macOS
   <img src="assets/telegram-preview.png" alt="herdr-telegram dark-mode iOS Telegram preview showing unattended Done digests, offline Whisper voice replies, tap-to-approve Blocked prompts, and live /target space autocomplete" width="100%" />
 </p>
 
-Swipe-reply with text, a voice note, or a screenshot (or prefix `auth: ship it`) and `herdr-telegram` delivers your prompt straight into that pane, waiting for Herdr to confirm the lifecycle transition so dropped or stalled prompts never fail silently.
+- **Debounced turn digests & tap-to-approve prompts:** Waits for quiet (`90s` default, instant on direct replies), suppresses background `/cowork` helper completions, and turns multi-option `Blocked` dialogs into TOCTOU-guarded tap buttons.
+- **Contextual swipe-replies & Telegram Quote Reply:** Swipe-replying to the latest card sends a clean prompt; scrolling up to reply to an older card or highlighting a sentence via Telegram's **Quote Reply** automatically attaches that message or excerpt as context.
+- **Live space-named `/` menus & inline pickers:** Autocompletes `/target_<space>` (and `/target_<space>_<model>` for review panes) directly inside Telegram's `/` popup, plus one-tap button pickers for `/target`, `/read`, `/key`, and `/spawn`.
+- **Two-way screenshots & opt-in voice notes:** Exchange PNG/JPEG/WebP/GIF images (`telegram-send --photo` and `.herdr-telegram/media`), and optionally enable free offline `faster-whisper` (`0 MB` idle RAM) or cloud voice-note transcription.
+- **Multi-bot TOML routing & Tailscale mobile previews:** Route workspaces across `1..N` user-named Telegram bots in `config.toml`, and expose `localhost` dev servers to your phone in one command with `ts-preview <port> --telegram`.
 
 ---
 
@@ -130,6 +134,33 @@ By default (`HERDR_SUMMARY_PROVIDER=auto`), it uses whichever CLI or API key you
 | `off` | Disables LLM calls; formats terminal output directly as clean HTML | None | None |
 
 You can also use `provider:model` shorthand directly in `HERDR_SUMMARY_MODEL` (such as `HERDR_SUMMARY_MODEL=claude:haiku` or `HERDR_SUMMARY_MODEL=ollama:qwen2.5:7b`) or override `summary_provider` / `summary_model` per route in `config.toml`.
+
+---
+
+## Optional Voice Notes (Offline Whisper or Cloud STT)
+
+Voice note transcription is **completely optional** so the core install stays zero-dependency (`0` extra pip packages and `0 MB` RAM/disk when left unconfigured, and `herdr-telegram doctor` reports `[OK] voice: optional`).
+
+To enable free, local, offline speech-to-text via [`faster-whisper`](https://github.com/SYSTRAN/faster-whisper) (`large-v3-turbo`, `int8`, Silero VAD):
+
+```bash
+herdr-telegram setup-voice
+# Or choose a lighter model on low-RAM machines:
+herdr-telegram setup-voice --model small.en
+```
+
+`setup-voice` provisions an isolated virtualenv in `~/.local/state/herdr-telegram/voice-venv` and runs `faster-whisper` **on demand** in a secret-scrubbed subprocess (`0 MB` idle daemon RAM), seeded with your live Herdr space names for accurate vocabulary recognition. Prefer a cloud STT API or turning voice off explicitly? Set `HERDR_VOICE_PROVIDER` in `~/.config/herdr-telegram/env` (or `voice_provider` in `config.toml`):
+
+| `HERDR_VOICE_PROVIDER` | How it runs | Default model | Auth / Config |
+| :--- | :--- | :--- | :--- |
+| `auto` *(default)* | Uses local `voice-venv` if installed, else `HERDR_VOICE_API_KEY` / cloud env key, else dormant | Provider default | Zero config |
+| `local` | Offline `faster-whisper` subprocess in `~/.local/state/herdr-telegram/voice-venv` | `large-v3-turbo` | `herdr-telegram setup-voice` (or `./install.sh --with-voice`) |
+| `openai` | `POST /v1/audio/transcriptions` (`HERDR_VOICE_API_URL` override supported) | `gpt-4o-mini-transcribe` | `HERDR_VOICE_API_KEY` or `OPENAI_API_KEY` |
+| `groq` | `POST https://api.groq.com/openai/v1/audio/transcriptions` | `whisper-large-v3-turbo` | `HERDR_VOICE_API_KEY` or `GROQ_API_KEY` |
+| `gemini-api` | `POST .../v1beta/models/<model>:generateContent` | `gemini-2.5-flash` | `HERDR_VOICE_API_KEY` or `GEMINI_API_KEY` |
+| `off` | Rejects voice notes with instructions to enable or keep disabled | None | None |
+
+When you hold Telegram's 🎙️ mic button, `herdr-telegram` echoes a `<blockquote>🎙️ "..."</blockquote>` transcript receipt and routes via swipe-reply, your `/target` pin, a spoken space prefix (`"Upgrade, run the auth tests"`), or an instant one-tap space picker.
 
 ---
 
