@@ -2310,7 +2310,12 @@ class HerdrTelegramBridgeTest(unittest.TestCase):
                     snapshots,
                     bot_role="prod",
                 )
-                self.assertEqual(herdr.prompts[-1], ("w21:p1", "check billing-api"))
+                # message_id=101 on prod_tg is older than message_id=102 (Blocked), so earlier-message context is attached;
+                # message_id=101 on dev_tg IS the latest message on dev_tg, so no wrapper is added there.
+                self.assertEqual(
+                    herdr.prompts[-1],
+                    ("w21:p1", "[Replying to earlier Telegram message]\n> alert\n\ncheck billing-api"),
+                )
                 self.assertEqual(daemon.state.prod_last_update_id, 50)
                 self.assertEqual(daemon.state.last_update_id, 0)
 
@@ -5687,6 +5692,177 @@ class HerdrTelegramBridgeTest(unittest.TestCase):
                     )
                 doc_checks2 = {c["name"]: c for c in json.loads(doc_out2.getvalue())["checks"]}
                 self.assertEqual(doc_checks2["voice"]["status"], "warn")
+            finally:
+                daemon.close()
+
+    def test_reply_context_injected_for_older_messages_and_manual_quotes_only(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            herdr = FakeHerdr(
+                {
+                    "w15:p1": make_snap(pane_id="w15:p1", workspace_id="w15", workspace_label="Auth", agent="claude"),
+                    "w22:p1": make_snap(pane_id="w22:p1", workspace_id="w22", workspace_label="Upgrade", agent="agy"),
+                }
+            )
+            fake_py = tmp_path / "fake_whisper.py"
+            fake_py.write_text(
+                "#!/usr/bin/env python3\n"
+                "import json, pathlib, sys\n"
+                "payload = pathlib.Path(sys.argv[3]).read_bytes()\n"
+                "spoken = payload.split(b'|TEXT:', 1)[1].decode('utf-8')\n"
+                "print(json.dumps({'text': spoken}))\n",
+                encoding="utf-8",
+            )
+            fake_py.chmod(0o755)
+            tg = FakeTelegram()
+            tg.files["v_old_reply"] = b"OggS\x00\x02\x00\x00\x00\x00\x00\x00\x00\x00OpusHead|TEXT:revert only that flag"
+            daemon = BridgeDaemon(
+                herdr=herdr,  # type: ignore[arg-type]
+                telegram=tg,  # type: ignore[arg-type]
+                chat_id="777",
+                state_path=tmp_path / "state.json",
+                async_summaries=False,
+                transcriber=VoiceTranscriber(provider="local", local_python=str(fake_py)),
+            )
+            try:
+                snapshots = daemon.poll_herdr_once()
+                # Auth sent msg 100 earlier, then Upgrade sent msg 105 (so 105 is latest in chat, 100 is older)
+                daemon.state.record_message(100, "w15:p1")
+                daemon.state.record_message(105, "w22:p1")
+
+                # 1. Replying to the MOST RECENT message (105) sends plain reply text without wrapper noise
+                daemon.handle_update(
+                    {
+                        "update_id": 1,
+                        "message": {
+                            "message_id": 201,
+                            "from": {"id": 777},
+                            "chat": {"id": 777, "type": "private"},
+                            "text": "ship it",
+                            "reply_to_message": {
+                                "message_id": 105,
+                                "text": "✅ Done · Upgrade (🤖 Agy)\n• Bumped dependencies.",
+                            },
+                        },
+                    },
+                    snapshots,
+                )
+                self.assertEqual(herdr.prompts[-1], ("w22:p1", "ship it"))
+
+                # 2. Replying to an OLDER message (100 < latest) automatically prepends the replied-to message context
+                #    while stripping any trailing 'Swipe-reply or prefix ...' boilerplate footer
+                daemon.handle_update(
+                    {
+                        "update_id": 2,
+                        "message": {
+                            "message_id": 202,
+                            "from": {"id": 777},
+                            "chat": {"id": 777, "type": "private"},
+                            "text": "add a rate limit here too",
+                            "reply_to_message": {
+                                "message_id": 100,
+                                "text": (
+                                    "✅ Done · Auth (🤖 Claude)\n"
+                                    "• Added email 2FA verification endpoint.\n"
+                                    "Swipe-reply or prefix claude: to reply."
+                                ),
+                            },
+                        },
+                    },
+                    snapshots,
+                )
+                sent_target, sent_prompt = herdr.prompts[-1]
+                self.assertEqual(sent_target, "w15:p1")
+                self.assertEqual(
+                    sent_prompt,
+                    "[Replying to earlier Telegram message]\n"
+                    "> ✅ Done · Auth (🤖 Claude)\n"
+                    "> • Added email 2FA verification endpoint.\n\n"
+                    "add a rate limit here too",
+                )
+
+                # 3. Highlighting a partial Telegram quote (is_manual=True) includes the excerpt even on the latest card
+                latest_id = max(int(k) for k in daemon.state.get_message_targets("default"))
+                daemon.state.record_message(latest_id + 10, "w22:p1")
+                newest_id = latest_id + 10
+                daemon.handle_update(
+                    {
+                        "update_id": 3,
+                        "message": {
+                            "message_id": 203,
+                            "from": {"id": 777},
+                            "chat": {"id": 777, "type": "private"},
+                            "text": "prune journal logs now",
+                            "reply_to_message": {
+                                "message_id": newest_id,
+                                "text": "✅ Done · Upgrade\n🟢 HTTP ok\n🔴 [P1] billing-api: disk at 94%",
+                            },
+                            "quote": {
+                                "text": "🔴 [P1] billing-api: disk at 94%",
+                                "is_manual": True,
+                            },
+                        },
+                    },
+                    snapshots,
+                )
+                self.assertEqual(
+                    herdr.prompts[-1],
+                    (
+                        "w22:p1",
+                        "[Replying to quoted excerpt on Telegram]\n"
+                        "> 🔴 [P1] billing-api: disk at 94%\n\n"
+                        "prune journal logs now",
+                    ),
+                )
+
+                # 4. Replying to a bare 1-line delivery ack ('➡️ Sent to ...') does not prepend boilerplate ack noise
+                daemon.handle_update(
+                    {
+                        "update_id": 4,
+                        "message": {
+                            "message_id": 204,
+                            "from": {"id": 777},
+                            "chat": {"id": 777, "type": "private"},
+                            "text": "status?",
+                            "reply_to_message": {
+                                "message_id": 100,
+                                "text": "➡️ Sent to Auth (🤖 Claude).",
+                            },
+                        },
+                    },
+                    snapshots,
+                )
+                self.assertEqual(herdr.prompts[-1], ("w15:p1", "status?"))
+
+                # 5. Voice-note swipe-reply to an older card injects context for the agent while keeping echo clean
+                daemon.handle_update(
+                    {
+                        "update_id": 5,
+                        "message": {
+                            "message_id": 205,
+                            "from": {"id": 777},
+                            "chat": {"id": 777, "type": "private"},
+                            "reply_to_message": {
+                                "message_id": 100,
+                                "text": "💬 Auth (🤖 Claude)\nEnabled strict TOTP enforcement.",
+                            },
+                            "voice": {"file_id": "v_old_reply", "file_size": 4096, "duration": 3},
+                        },
+                    },
+                    snapshots,
+                )
+                self.assertEqual(
+                    herdr.prompts[-1],
+                    (
+                        "w15:p1",
+                        "[Replying to earlier Telegram message]\n"
+                        "> 💬 Auth (🤖 Claude)\n"
+                        "> Enabled strict TOTP enforcement.\n\n"
+                        "revert only that flag",
+                    ),
+                )
+                self.assertIn("<blockquote>revert only that flag</blockquote>", tg.sent[-1]["text"])
+                self.assertNotIn("[Replying to earlier Telegram message]", tg.sent[-1]["text"])
             finally:
                 daemon.close()
 

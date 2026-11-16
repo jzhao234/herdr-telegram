@@ -138,7 +138,7 @@ On startup, `herdr-telegram` automatically registers these commands in Telegram'
 
 | Action | Syntax | What it does |
 | :--- | :--- | :--- |
-| **Swipe-reply** | Swipe any alert or `telegram-send` card | Sends your reply, voice note, or photo straight to the bound pane (skips the idle completion wait) |
+| **Swipe-reply** | Swipe any alert or `telegram-send` card | Sends your reply, voice note, or photo straight to the bound pane (skips the idle wait, and automatically quotes the message if you reply to an older card or highlight an excerpt) |
 | **Space / model prefix** | `upgrade: run the auth tests` | Routes text or a photo caption to the `Upgrade` lead agent (or `upgrade_opus:` / `migration_gpt5_1:` for review agents; `opus:` and `w12:p1:` also work) |
 | **Send voice note** | Hold Telegram's 🎙️ mic button (or share `.ogg`/`.m4a`/`.mp3`/`.wav`) | Transcribes speech locally via `faster-whisper` (or cloud STT), routes via swipe-reply, pinned `/target`, spoken `"Upgrade, ..."` prefix, or a one-tap space picker, and echoes the transcript back |
 | **Send photo / screenshot** | Attach photo, album, or PNG/JPEG/WebP/GIF file | Saves images inside `<workspace>/.herdr-telegram/media` (`0600`, auto-excluded from `git status`), coalesces multi-photo albums into a single prompt, and prompts the target agent to inspect them |

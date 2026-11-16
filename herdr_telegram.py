@@ -3454,6 +3454,98 @@ def resolve_reply_target(
     return None, body
 
 
+MAX_REPLY_CONTEXT_CHARS = 1200
+_BARE_ACK_LINE_RE = re.compile(r"^(?:➡️|📷|⌨️)\s+Sent\b[^\n]*$")
+
+
+def is_latest_tracked_message(
+    reply_to_message: Mapping[str, Any] | None,
+    state: BridgeState,
+    bot_role: str = "default",
+) -> bool:
+    """Return True only when reply_to_message is the newest tracked bot message in bot_role."""
+    if not reply_to_message:
+        return True
+    raw_mid = reply_to_message.get("message_id")
+    try:
+        replied_id = int(str(raw_mid).strip())
+    except (TypeError, ValueError):
+        return False
+    tracked = state.get_message_targets(bot_role)
+    if not tracked:
+        return False
+    id_set: set[int] = set()
+    for k in tracked:
+        with contextlib.suppress(ValueError):
+            id_set.add(int(k))
+    if not id_set or replied_id not in id_set:
+        return False
+    return replied_id == max(id_set)
+
+
+def extract_reply_context_snippet(
+    reply_to_message: Mapping[str, Any] | None,
+    quote: Mapping[str, Any] | None = None,
+    *,
+    is_latest: bool = False,
+    max_chars: int = MAX_REPLY_CONTEXT_CHARS,
+) -> str:
+    """Extract quoted message text when replying to an older message or a manual Telegram quote."""
+    manual_quote = ""
+    if isinstance(quote, Mapping):
+        q_text = str(quote.get("text") or "").strip()
+        if q_text and bool(quote.get("is_manual", True)):
+            manual_quote = q_text
+
+    if is_latest and not manual_quote:
+        return ""
+
+    raw_reply = ""
+    if isinstance(reply_to_message, Mapping):
+        raw_reply = str(reply_to_message.get("text") or reply_to_message.get("caption") or "").strip()
+
+    chosen = manual_quote or raw_reply
+    if not chosen:
+        return ""
+
+    lines = [ln.rstrip() for ln in chosen.splitlines()]
+    while lines and (FOOTER_PANE_RE.search(lines[-1]) or FOOTER_HANDLE_RE.search(lines[-1])):
+        lines.pop()
+    cleaned = "\n".join(lines).strip()
+    if not cleaned or _BARE_ACK_LINE_RE.match(cleaned):
+        return ""
+    if len(cleaned) > max_chars:
+        cleaned = f"{cleaned[: max_chars - 1].rstrip()}…"
+    return cleaned
+
+
+def attach_reply_context(
+    prompt_body: str,
+    reply_to_message: Mapping[str, Any] | None,
+    state: BridgeState,
+    *,
+    bot_role: str = "default",
+    quote: Mapping[str, Any] | None = None,
+) -> str:
+    """Prepend quoted Telegram context when replying to a non-latest message or highlighted excerpt."""
+    if not reply_to_message:
+        return prompt_body
+    latest = is_latest_tracked_message(reply_to_message, state, bot_role=bot_role)
+    snippet = extract_reply_context_snippet(reply_to_message, quote=quote, is_latest=latest)
+    if not snippet:
+        return prompt_body
+    has_manual_quote = (
+        isinstance(quote, Mapping) and bool(str(quote.get("text") or "").strip()) and bool(quote.get("is_manual", True))
+    )
+    header = (
+        "[Replying to quoted excerpt on Telegram]" if has_manual_quote else "[Replying to earlier Telegram message]"
+    )
+    quoted_block = "\n".join(f"> {line}" if line else ">" for line in snippet.splitlines())
+    if not prompt_body.strip():
+        return f"{header}\n{quoted_block}"
+    return f"{header}\n{quoted_block}\n\n{prompt_body}"
+
+
 class HerdrClient:
     def __init__(
         self,
@@ -4155,6 +4247,7 @@ class PendingAlbum:
     candidates: list[InboundImageCandidate] = field(default_factory=list)
     caption: str = ""
     reply_to_message: dict[str, Any] | None = None
+    quote: dict[str, Any] | None = None
 
 
 @dataclass
@@ -5080,6 +5173,7 @@ class BridgeDaemon:
                     album.first_msg_id,
                     active_snapshots,
                     bot_role=album.bot_role,
+                    quote=album.quote,
                 )
             except Exception as exc:
                 logger.exception(
@@ -5201,6 +5295,7 @@ class BridgeDaemon:
         snapshots: dict[str, AgentSnapshot],
         *,
         bot_role: str = "default",
+        quote: dict[str, Any] | None = None,
     ) -> None:
         tg_client, active_chat_id = self._channel_context(bot_role)
         caption_cmd = parse_slash_command(caption) if caption else None
@@ -5288,7 +5383,14 @@ class BridgeDaemon:
             )
             return
 
-        prompt_body = format_image_prompt(caption_body, saved_paths)
+        caption_with_ctx = attach_reply_context(
+            caption_body,
+            reply_to_message,
+            self.state,
+            bot_role=bot_role,
+            quote=quote,
+        )
+        prompt_body = format_image_prompt(caption_with_ctx, saved_paths)
         self._send_prompt_to_target(
             target,
             prompt_body,
@@ -5350,6 +5452,7 @@ class BridgeDaemon:
         snapshots: dict[str, AgentSnapshot],
         *,
         bot_role: str = "default",
+        quote: dict[str, Any] | None = None,
     ) -> None:
         tg_client, active_chat_id = self._channel_context(bot_role)
         caption_cmd = parse_slash_command(caption) if caption else None
@@ -5429,9 +5532,16 @@ class BridgeDaemon:
             )
             if reply_target:
                 combined = f"{caption}\n\n{transcript}".strip() if caption else transcript
+                prompt_with_ctx = attach_reply_context(
+                    combined,
+                    reply_to_message,
+                    self.state,
+                    bot_role=bot_role,
+                    quote=quote,
+                )
                 self._send_prompt_to_target(
                     reply_target,
-                    combined,
+                    prompt_with_ctx,
                     msg_id,
                     snapshots,
                     bot_role=bot_role,
@@ -5626,6 +5736,8 @@ class BridgeDaemon:
             )
             return
 
+        msg_quote = msg.get("quote") if isinstance(msg.get("quote"), dict) else None
+
         if isinstance(voice_info, InboundVoiceCandidate):
             self._deliver_voice_message(
                 voice_info,
@@ -5634,6 +5746,7 @@ class BridgeDaemon:
                 msg_id,
                 snapshots,
                 bot_role=bot_role,
+                quote=msg_quote,
             )
             return
 
@@ -5658,6 +5771,8 @@ class BridgeDaemon:
                     album.caption = raw_caption
                 if msg.get("reply_to_message") and album.reply_to_message is None:
                     album.reply_to_message = msg.get("reply_to_message")
+                if msg_quote and album.quote is None:
+                    album.quote = msg_quote
                 return
             self._deliver_image_batch(
                 [media_info],
@@ -5666,6 +5781,7 @@ class BridgeDaemon:
                 msg_id,
                 snapshots,
                 bot_role=bot_role,
+                quote=msg_quote,
             )
             return
 
@@ -5966,7 +6082,14 @@ class BridgeDaemon:
             )
             return
 
-        self._send_prompt_to_target(target, prompt_body, msg_id, snapshots, bot_role=bot_role)
+        prompt_with_ctx = attach_reply_context(
+            prompt_body,
+            msg.get("reply_to_message"),
+            self.state,
+            bot_role=bot_role,
+            quote=msg_quote,
+        )
+        self._send_prompt_to_target(target, prompt_with_ctx, msg_id, snapshots, bot_role=bot_role)
 
     def _send_spawn_blocked(
         self,
