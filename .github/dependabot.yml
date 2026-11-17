@@ -1,0 +1,8 @@
+version: 2
+updates:
+  # The bridge has no runtime dependencies (pyproject `dependencies = []`),
+  # so only the pinned GitHub Actions in CI need watching.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
