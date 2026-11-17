@@ -1,0 +1,61 @@
+id = "jzhao234.herdr-telegram"
+name = "Herdr Telegram Bridge"
+version = "0.3.0"
+min_herdr_version = "0.8.0"
+description = "Two-way Telegram bridge and Tailscale mobile preview toolkit for Herdr agents: turn digests, tap-to-approve buttons, contextual swipe-replies, screenshots, and optional offline Whisper voice notes."
+platforms = ["linux", "macos"]
+
+[[panes]]
+id = "setup"
+title = "Pair Telegram Bot & Start Service"
+description = "Install the background service (if needed) and run the 30-second @BotFather pairing wizard."
+placement = "popup"
+width = "80%"
+height = 28
+command = ["bash", "herdr-plugin-runner.sh", "pane-setup"]
+
+[[panes]]
+id = "doctor"
+title = "Telegram Bridge Doctor"
+description = "Run full health diagnostics on Telegram bots, Herdr CLI, summarizer, voice backend, and OS service."
+placement = "popup"
+width = "80%"
+height = 22
+command = ["bash", "herdr-plugin-runner.sh", "pane-doctor"]
+
+[[panes]]
+id = "setup-voice"
+title = "Setup Offline Whisper Voice Notes"
+description = "Provision optional local offline faster-whisper (large-v3-turbo) for Telegram voice messages."
+placement = "popup"
+width = "80%"
+height = 24
+command = ["bash", "herdr-plugin-runner.sh", "pane-setup-voice"]
+
+[[actions]]
+id = "send-selection"
+title = "Send Selected Text to Telegram"
+description = "Send the selected terminal text to Telegram bound to the active pane for swipe-reply routing."
+contexts = ["selection"]
+command = ["bash", "herdr-plugin-runner.sh", "send-selection"]
+
+[[actions]]
+id = "send-pane-snapshot"
+title = "Send Pane Snapshot to Telegram"
+description = "Send recent terminal lines from the focused Herdr pane to Telegram bound for swipe-reply routing."
+contexts = ["pane"]
+command = ["bash", "herdr-plugin-runner.sh", "send-pane-snapshot"]
+
+[[actions]]
+id = "doctor"
+title = "Run Telegram Bridge Doctor"
+description = "Check Telegram bot connectivity, summarizer, voice readiness, and background service status."
+contexts = ["global"]
+command = ["bash", "herdr-plugin-runner.sh", "doctor"]
+
+[[actions]]
+id = "restart-service"
+title = "Restart Telegram Bridge Service"
+description = "Restart the background herdr-telegram systemd or launchd service."
+contexts = ["global"]
+command = ["bash", "herdr-plugin-runner.sh", "restart-service"]

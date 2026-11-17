@@ -42,6 +42,8 @@ herdr-telegram/
 │   ├── voice.py             # Optional voice/audio sniffing, local faster-whisper + cloud STT, spoken prefixes
 │   └── cli.py               # 'setup', 'setup-voice', 'doctor', env atomic writer, systemd/launchd helpers
 ├── install.sh               # Idempotent Linux/macOS installer, skill installer, and uninstaller
+├── herdr-plugin.toml        # Herdr plugin marketplace manifest (panes & actions for herdr.dev/plugins)
+├── herdr-plugin-runner.sh   # Helper runner for Herdr plugin popups and pane/selection Telegram actions
 ├── herdr-telegram.service   # Linux systemd --user unit template
 ├── config.example.toml      # Annotated modular TOML configuration template
 ├── env.example              # Annotated ~/.config/herdr-telegram/env template

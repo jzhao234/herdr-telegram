@@ -34,6 +34,13 @@ Requires Linux (`systemd --user`) or macOS (`launchd`), `python3` (>= 3.11), `gi
 curl -fsSL https://raw.githubusercontent.com/jzhao234/herdr-telegram/main/install.sh | bash
 ```
 
+Or install as a [Herdr plugin](https://herdr.dev/plugins/) (adds popup `setup` / `doctor` / `setup-voice` panes plus `Send Selected Text` and `Send Pane Snapshot` actions inside Herdr):
+
+```bash
+herdr plugin install jzhao234/herdr-telegram
+herdr plugin pane open --plugin jzhao234.herdr-telegram --entrypoint setup
+```
+
 Or from a local clone (symlinks your checkout directly for easy hacking):
 
 ```bash

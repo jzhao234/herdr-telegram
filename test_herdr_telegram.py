@@ -5893,6 +5893,166 @@ class HerdrTelegramBridgeTest(unittest.TestCase):
             finally:
                 daemon.close()
 
+    def test_herdr_plugin_manifest_and_runner(self) -> None:
+        import stat
+        import tomllib
+        from http.server import ThreadingHTTPServer
+
+        import herdr_telegram as ht
+
+        repo_root = Path(__file__).resolve().parent
+        manifest_path = repo_root / "herdr-plugin.toml"
+        runner_path = repo_root / "herdr-plugin-runner.sh"
+        self.assertTrue(manifest_path.is_file())
+        self.assertTrue(runner_path.is_file())
+
+        raw_text = manifest_path.read_text(encoding="utf-8")
+        self.assertNotIn("—", raw_text)
+        manifest = tomllib.loads(raw_text)
+
+        self.assertEqual(manifest["id"], "jzhao234.herdr-telegram")
+        self.assertEqual(manifest["name"], "Herdr Telegram Bridge")
+        self.assertEqual(manifest["version"], ht.__version__)
+        self.assertEqual(manifest["min_herdr_version"], "0.8.0")
+        self.assertEqual(manifest["platforms"], ["linux", "macos"])
+
+        pane_ids: set[str] = set()
+        for pane in manifest.get("panes", []):
+            pid = pane["id"]
+            self.assertNotIn(".", pid)
+            self.assertNotIn(pid, pane_ids)
+            pane_ids.add(pid)
+            self.assertIn(pane.get("placement", "overlay"), {"overlay", "popup", "split", "tab", "zoomed"})
+            self.assertEqual(pane["command"][:2], ["bash", "herdr-plugin-runner.sh"])
+
+        action_ids: set[str] = set()
+        valid_contexts = {"global", "workspace", "tab", "pane", "selection"}
+        for action in manifest.get("actions", []):
+            aid = action["id"]
+            self.assertNotIn(".", aid)
+            self.assertNotIn(aid, action_ids)
+            action_ids.add(aid)
+            self.assertTrue(set(action.get("contexts", [])).issubset(valid_contexts))
+            self.assertEqual(action["command"][:2], ["bash", "herdr-plugin-runner.sh"])
+
+        self.assertEqual(pane_ids, {"setup", "doctor", "setup-voice"})
+        self.assertEqual(action_ids, {"send-selection", "send-pane-snapshot", "doctor", "restart-service"})
+
+        # Verify runner handles 'send-selection' and 'send-pane-snapshot' against a local fake Telegram server
+        sent_payloads: list[dict[str, Any]] = []
+
+        class OkTelegramHandler(BaseHTTPRequestHandler):
+            def do_POST(self) -> None:
+                length = int(self.headers.get("Content-Length", "0"))
+                raw = self.rfile.read(length)
+                sent_payloads.append(json.loads(raw.decode("utf-8")))
+                body = json.dumps({"ok": True, "result": {"message_id": 777}}).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, format: str, *args: Any) -> None:
+                return
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), OkTelegramHandler)
+        srv_thread = threading.Thread(target=server.serve_forever, daemon=True)
+        srv_thread.start()
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                tmp_dir = Path(tmp)
+                cfg_dir = tmp_dir / "cfg"
+                state_dir = tmp_dir / "state"
+                cfg_dir.mkdir(mode=0o700)
+                state_dir.mkdir(mode=0o700)
+                env_file = cfg_dir / "env"
+                env_file.write_text(
+                    "TELEGRAM_BOT_TOKEN=123456789:AAH_test_plugin_runner_token_0000\nTELEGRAM_CHAT_ID=999\n",
+                    encoding="utf-8",
+                )
+                os.chmod(env_file, 0o600)
+
+                fake_herdr = tmp_dir / "fake-herdr"
+                fake_herdr.write_text(
+                    "#!/usr/bin/env python3\n"
+                    "import json, sys\n"
+                    "args = sys.argv[1:]\n"
+                    "if args[:2] == ['pane', 'read']:\n"
+                    "    print('line 1: tests green\\nline 2: ready to ship')\n"
+                    "elif args[:2] == ['agent', 'list']:\n"
+                    "    print(json.dumps([{'pane_id': 'w9:p1', 'workspace_id': 'w9', 'workspace_label': 'Auth', "
+                    "'agent': 'claude', 'status': 'idle', 'terminal_id': 't1'}]))\n"
+                    "elif args[:2] == ['workspace', 'list']:\n"
+                    "    print(json.dumps([{'id': 'w9', 'label': 'Auth', 'cwd': '/tmp'}]))\n"
+                    "else:\n"
+                    "    print('{}')\n",
+                    encoding="utf-8",
+                )
+                os.chmod(fake_herdr, stat.S_IRWXU)
+
+                # Patch TelegramClient.API_BASE via PYTHONPATH sitecustomize shim inside tmp_dir
+                shim_dir = tmp_dir / "shim"
+                shim_dir.mkdir()
+                port = server.server_address[1]
+                (shim_dir / "sitecustomize.py").write_text(
+                    f"import urllib.request\n"
+                    f"_orig = urllib.request.Request\n"
+                    f"class _RedirReq(_orig):\n"
+                    f"    def __init__(self, url, *a, **kw):\n"
+                    f"        if isinstance(url, str) and url.startswith('https://api.telegram.org/'):\n"
+                    f"            url = url.replace('https://api.telegram.org/', 'http://127.0.0.1:{port}/', 1)\n"
+                    f"        super().__init__(url, *a, **kw)\n"
+                    f"urllib.request.Request = _RedirReq\n",
+                    encoding="utf-8",
+                )
+
+                base_env = {
+                    **os.environ,
+                    "HERDR_TELEGRAM_CONFIG_DIR": str(cfg_dir),
+                    "HERDR_TELEGRAM_STATE_DIR": str(state_dir),
+                    "HERDR_BIN_PATH": str(fake_herdr),
+                    "PATH": f"{tmp_dir}:{os.environ.get('PATH', '')}",
+                    "PYTHONPATH": str(shim_dir),
+                }
+
+                # 1. send-selection
+                sel_env = {
+                    **base_env,
+                    "HERDR_PLUGIN_CONTEXT_JSON": json.dumps(
+                        {"focused_pane_id": "w9:p1", "selected_text": "AssertionError in test_login"}
+                    ),
+                }
+                proc_sel = subprocess.run(
+                    ["bash", str(runner_path), "send-selection"],
+                    env=sel_env,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=10,
+                )
+                self.assertEqual(proc_sel.returncode, 0, msg=proc_sel.stderr)
+                self.assertIn("AssertionError in test_login", sent_payloads[-1]["text"])
+
+                # 2. send-pane-snapshot
+                snap_env = {
+                    **base_env,
+                    "HERDR_PLUGIN_CONTEXT_JSON": json.dumps({"focused_pane_id": "w9:p1"}),
+                }
+                proc_snap = subprocess.run(
+                    ["bash", str(runner_path), "send-pane-snapshot"],
+                    env=snap_env,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=10,
+                )
+                self.assertEqual(proc_snap.returncode, 0, msg=proc_snap.stderr)
+                self.assertIn("ready to ship", sent_payloads[-1]["text"])
+        finally:
+            server.shutdown()
+            server.server_close()
+
 
 if __name__ == "__main__":
     unittest.main()

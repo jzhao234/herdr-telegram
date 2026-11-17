@@ -34,7 +34,7 @@ jobs:
           python -m pip install --upgrade pip ruff
           ruff format --check . herdr-telegram telegram-send ts-preview
           ruff check . herdr-telegram telegram-send ts-preview
-          shellcheck install.sh
+          shellcheck install.sh herdr-plugin-runner.sh
       - name: Run unit tests
         run: python -m unittest discover -s . -v
       - name: Package install and CLI smoke test
